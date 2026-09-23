@@ -1,39 +1,57 @@
+import argparse
+
 import matplotlib.pyplot as plt
 import torch
 
-from fictitious_play.benchmark import equilibrium_bid
+from fictitious_play.benchmark import equilibrium_bid, theoretical_win_probability
 from fictitious_play.train import FictitiousPlayTrainer
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-agents", type=int, default=2)
+    parser.add_argument("--n-rounds", type=int, default=200)
+    parser.add_argument("--sample-size", type=int, default=300_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--critic-agent", type=int, default=0,
+                         help="Which agent's critic to plot.")
+    return parser.parse_args()
+
+
 def main():
-    trainer = FictitiousPlayTrainer(n_rounds=200, sample_size=300_000, seed=0)
+    args = parse_args()
+    trainer = FictitiousPlayTrainer(
+        n_agents=args.n_agents, n_rounds=args.n_rounds,
+        sample_size=args.sample_size, seed=args.seed,
+    )
+    print(f"Device: {trainer.device}")
     history = trainer.run()
 
     rounds = [h["round"] for h in history]
-    mse0 = [h["mse_agent_0"] for h in history]
-    mse1 = [h["mse_agent_1"] for h in history]
+    mse_per_agent = list(zip(*(h["mse"] for h in history)))
 
     plt.figure()
-    plt.plot(rounds, mse0, label="Agente 0")
-    plt.plot(rounds, mse1, label="Agente 1")
+    for i, mse_series in enumerate(mse_per_agent):
+        plt.plot(rounds, mse_series, label=f"Agente {i}")
     plt.yscale("log")
     plt.xlabel("Rodada")
     plt.ylabel("MSE vs. equilíbrio teórico (escala log)")
     plt.legend()
-    plt.title("Convergência ao equilíbrio de Bayes-Nash (b*(v) = v/2)")
+    plt.title(f"Convergência ao equilíbrio de Bayes-Nash (N={args.n_agents})")
     plt.tight_layout()
     plt.savefig("convergence.png", dpi=150)
 
-    v_grid = torch.linspace(0, 1, 200).unsqueeze(1)
+    v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
-        b0 = trainer.agents[0](v_grid).squeeze(1)
-        b1 = trainer.agents[1](v_grid).squeeze(1)
-        b_star = equilibrium_bid(v_grid).squeeze(1)
+        b_star = equilibrium_bid(v_grid, args.n_agents).squeeze(1).cpu()
+        v_grid_cpu = v_grid.squeeze(1).cpu()
+        bids = [trainer.agents[i](v_grid).squeeze(1).cpu() for i in range(args.n_agents)]
 
     plt.figure()
-    plt.plot(v_grid.squeeze(1), b0, label="Agente 0 (aprendido)")
-    plt.plot(v_grid.squeeze(1), b1, label="Agente 1 (aprendido)")
-    plt.plot(v_grid.squeeze(1), b_star, "--", label="Equilíbrio teórico b*(v) = v/2")
+    for i, b in enumerate(bids):
+        plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
+    plt.plot(v_grid_cpu, b_star, "--", color="black",
+              label=f"Equilíbrio teórico b*(v) = v*(N-1)/N")
     plt.xlabel("Valor v")
     plt.ylabel("Lance b")
     plt.legend()
@@ -41,7 +59,23 @@ def main():
     plt.tight_layout()
     plt.savefig("bid_function.png", dpi=150)
 
-    print("Figuras salvas em convergence.png e bid_function.png")
+    critic = trainer.critic_for(args.critic_agent)
+    b_grid = torch.linspace(0, 1, 300, device=trainer.device)
+    with torch.no_grad():
+        learned_p_win = critic.predict_win_prob(b_grid).cpu()
+        theoretical_p_win = theoretical_win_probability(b_grid, args.n_agents).cpu()
+
+    plt.figure()
+    plt.plot(b_grid.cpu(), learned_p_win, label="Crítico aprendido (KDE)")
+    plt.plot(b_grid.cpu(), theoretical_p_win, "--", color="black", label="P(vitória|b) teórica")
+    plt.xlabel("Lance b")
+    plt.ylabel("P(vitória | b)")
+    plt.legend()
+    plt.title(f"Crítico do agente {args.critic_agent} (N={args.n_agents})")
+    plt.tight_layout()
+    plt.savefig("critic.png", dpi=150)
+
+    print("Figuras salvas em convergence.png, bid_function.png e critic.png")
 
 
 if __name__ == "__main__":

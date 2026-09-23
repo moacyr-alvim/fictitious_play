@@ -22,11 +22,13 @@ class KDECritic:
     """
 
     def __init__(self, grid_size: int = 4001, grid_min: float = -0.25,
-                 grid_max: float = 1.25, n_bins: int = 4000):
+                 grid_max: float = 1.25, n_bins: int = 4000,
+                 device: torch.device | str | None = None):
         self.grid_size = grid_size
         self.grid_min = grid_min
         self.grid_max = grid_max
         self.n_bins = n_bins
+        self.device = torch.device(device) if device else torch.device("cpu")
         self.grid: torch.Tensor | None = None
         self.cdf_values: torch.Tensor | None = None
 
@@ -57,8 +59,8 @@ class KDECritic:
         cdf_corrected = np.clip(2 * cdf_aug - 1, 0.0, 1.0)
         cdf_corrected = np.maximum.accumulate(cdf_corrected)  # guard tiny fp non-monotonicity
 
-        self.grid = torch.tensor(grid, dtype=torch.float32)
-        self.cdf_values = torch.tensor(cdf_corrected, dtype=torch.float32)
+        self.grid = torch.tensor(grid, dtype=torch.float32, device=self.device)
+        self.cdf_values = torch.tensor(cdf_corrected, dtype=torch.float32, device=self.device)
 
     def predict_win_prob(self, bids: torch.Tensor) -> torch.Tensor:
         if self.grid is None:
