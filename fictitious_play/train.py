@@ -6,7 +6,7 @@ import torch
 
 from .actor import Actor
 from .benchmark import equilibrium_bid, theoretical_expected_payoff
-from .critic import KDECritic
+from .critic import SplineCritic
 
 
 class FictitiousPlayTrainer:
@@ -23,7 +23,7 @@ class FictitiousPlayTrainer:
     history of opponent play), which damps the best-response cycles that
     appear with more than two agents.
 
-    Each "round" is a single agent's turn: the KDECritic it best-responds to
+    Each "round" is a single agent's turn: the SplineCritic it best-responds to
     is fit on the max bid drawn from the *belief buffers* of the other N-1
     agents (winning means beating all of them), the agent is trained by
     gradient ascent on E_v[(v - b) * P(win | b)] until an EMA-smoothed loss
@@ -109,17 +109,17 @@ class FictitiousPlayTrainer:
                  for idx in opponent_indices]
         return np.maximum.reduce(draws)
 
-    def critic_for(self, mover_idx: int) -> KDECritic:
+    def critic_for(self, mover_idx: int) -> SplineCritic:
         """Fits (without training) the critic mover_idx currently faces,
         i.e. the smoothed CDF of the max bid drawn from the other agents'
         belief buffers."""
         opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
         opponent_bids = self._sample_max_belief_bids(opponent_indices)
-        critic = KDECritic(device=self.device)
+        critic = SplineCritic(device=self.device)
         critic.fit(opponent_bids)
         return critic
 
-    def _best_response(self, mover_idx: int, critic: KDECritic) -> int:
+    def _best_response(self, mover_idx: int, critic: SplineCritic) -> int:
         actor = self.agents[mover_idx]
         optimizer = self.optimizers[mover_idx]
 
@@ -239,7 +239,7 @@ class FictitiousPlayTrainer:
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 
             opponent_bids = self._sample_max_belief_bids(opponent_indices)
-            critic = KDECritic(device=self.device)
+            critic = SplineCritic(device=self.device)
             critic.fit(opponent_bids)
 
             steps_taken = self._best_response(mover_idx, critic)

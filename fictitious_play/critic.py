@@ -1,76 +1,80 @@
 import numpy as np
 import torch
-from scipy.stats import norm
 
 
-class KDECritic:
-    """Estimates P(win | b) = P(opponent's bid < b) as a Gaussian-kernel
-    smoothed empirical CDF of the opponent's observed bids.
+class SplineCritic:
+    """Estimates P(win | b) = P(opponent's bid < b) with a monotone cubic
+    Hermite spline (the PCHIP construction, Fritsch-Carlson derivatives)
+    fit to quantiles of the opponent's bid sample.
 
-    Bids live on [0, inf), so a plain KDE leaks density/mass below 0 and
-    underestimates P(win | b) for small b. This is corrected with the
-    standard reflection trick: the opponent's bid sample is mirrored about 0
-    before smoothing, which makes the augmented distribution symmetric
-    around 0 (so its CDF at 0 is exactly 1/2), and the corrected CDF for
-    b >= 0 recovers as F(b) = 2 * F_aug(b) - 1.
-
-    The smoothed CDF is evaluated once, on a fixed grid, using a histogram
-    of the (large) bid sample so cost does not scale with the sample size.
-    Arbitrary query bids are obtained via differentiable linear
-    interpolation on that grid, so gradients flow back into the actor
-    that produced the bids.
+    Unlike a kernel density estimate, this needs no bandwidth selection and
+    no boundary correction: quantiles of the sample already give a proper
+    empirical CDF that respects b >= 0 exactly (no probability mass can leak
+    below the smallest observed bid), and with a large sample a modest
+    number of quantile points already traces the CDF closely, so
+    interpolating them with a monotone spline is both smooth (needed for
+    the actor's gradient) and, unlike the previous dense KDE matrix
+    evaluation, cheap regardless of the sample size.
     """
 
-    def __init__(self, grid_size: int = 4001, grid_min: float = -0.25,
-                 grid_max: float = 1.25, n_bins: int = 4000,
-                 device: torch.device | str | None = None):
-        self.grid_size = grid_size
-        self.grid_min = grid_min
-        self.grid_max = grid_max
-        self.n_bins = n_bins
+    def __init__(self, n_quantiles: int = 400, device: torch.device | str | None = None):
+        self.n_quantiles = n_quantiles
         self.device = torch.device(device) if device else torch.device("cpu")
-        self.grid: torch.Tensor | None = None
+        self.bid_points: torch.Tensor | None = None
         self.cdf_values: torch.Tensor | None = None
+        self.derivatives: torch.Tensor | None = None
 
     @staticmethod
-    def _silverman_bandwidth(samples: np.ndarray) -> float:
-        n = len(samples)
-        std = np.std(samples, ddof=1)
-        q75, q25 = np.percentile(samples, [75, 25])
-        iqr = q75 - q25
-        spread = min(std, iqr / 1.34) if iqr > 0 else std
-        spread = spread if spread > 0 else 1e-3
-        return 0.9 * spread * n ** (-1 / 5)
+    def _monotone_derivatives(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Fritsch-Carlson derivatives: the same choice PCHIP uses to keep
+        the Hermite spline monotone wherever the data is monotone."""
+        secants = np.diff(y) / np.diff(x)
+        m = np.empty_like(y)
+        m[0] = secants[0]
+        m[-1] = secants[-1]
+        same_sign = secants[:-1] * secants[1:] > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            harmonic = 2 * secants[:-1] * secants[1:] / (secants[:-1] + secants[1:])
+        m[1:-1] = np.where(same_sign, harmonic, 0.0)
+        return m
 
     def fit(self, opponent_bids: np.ndarray) -> None:
-        h = self._silverman_bandwidth(opponent_bids)
-        augmented = np.concatenate([opponent_bids, -opponent_bids])
+        quantile_levels = np.linspace(0.0, 1.0, self.n_quantiles)
+        bid_points = np.quantile(opponent_bids, quantile_levels)
 
-        bin_edges = np.linspace(augmented.min() - 4 * h, augmented.max() + 4 * h,
-                                 self.n_bins + 1)
-        counts, edges = np.histogram(augmented, bins=bin_edges)
-        bin_centers = 0.5 * (edges[:-1] + edges[1:])
-        weights = counts / augmented.size
+        # De-duplicate tied bid values (keep the *last*, i.e. largest, quantile
+        # level for each distinct bid, since the array is sorted ascending).
+        unique_x, first_idx = np.unique(bid_points, return_index=True)
+        _, last_idx_rev = np.unique(bid_points[::-1], return_index=True)
+        last_idx = len(bid_points) - 1 - last_idx_rev
+        cdf_values = quantile_levels[np.sort(last_idx)]
+        bid_points = unique_x
 
-        grid = np.linspace(self.grid_min, self.grid_max, self.grid_size)
-        z = (grid[:, None] - bin_centers[None, :]) / h
-        cdf_aug = (norm.cdf(z) * weights[None, :]).sum(axis=1)
+        derivatives = self._monotone_derivatives(bid_points, cdf_values)
 
-        cdf_corrected = np.clip(2 * cdf_aug - 1, 0.0, 1.0)
-        cdf_corrected = np.maximum.accumulate(cdf_corrected)  # guard tiny fp non-monotonicity
-
-        self.grid = torch.tensor(grid, dtype=torch.float32, device=self.device)
-        self.cdf_values = torch.tensor(cdf_corrected, dtype=torch.float32, device=self.device)
+        self.bid_points = torch.tensor(bid_points, dtype=torch.float32, device=self.device)
+        self.cdf_values = torch.tensor(cdf_values, dtype=torch.float32, device=self.device)
+        self.derivatives = torch.tensor(derivatives, dtype=torch.float32, device=self.device)
 
     def predict_win_prob(self, bids: torch.Tensor) -> torch.Tensor:
-        if self.grid is None:
-            raise RuntimeError("KDECritic must be fit before calling predict_win_prob.")
+        if self.bid_points is None:
+            raise RuntimeError("SplineCritic must be fit before calling predict_win_prob.")
 
-        bids_clamped = bids.clamp(self.grid[0].item(), self.grid[-1].item())
-        idx = torch.searchsorted(self.grid, bids_clamped.detach())
-        idx = idx.clamp(1, len(self.grid) - 1)
+        bids_clamped = bids.clamp(self.bid_points[0].item(), self.bid_points[-1].item())
+        idx = torch.searchsorted(self.bid_points, bids_clamped.detach())
+        idx = idx.clamp(1, len(self.bid_points) - 1)
 
-        x0, x1 = self.grid[idx - 1], self.grid[idx]
-        f0, f1 = self.cdf_values[idx - 1], self.cdf_values[idx]
-        slope = (f1 - f0) / (x1 - x0)
-        return f0 + slope * (bids_clamped - x0)
+        x0, x1 = self.bid_points[idx - 1], self.bid_points[idx]
+        y0, y1 = self.cdf_values[idx - 1], self.cdf_values[idx]
+        m0, m1 = self.derivatives[idx - 1], self.derivatives[idx]
+
+        h = x1 - x0
+        t = (bids_clamped - x0) / h
+
+        # Cubic Hermite basis functions.
+        h00 = 2 * t**3 - 3 * t**2 + 1
+        h10 = t**3 - 2 * t**2 + t
+        h01 = -2 * t**3 + 3 * t**2
+        h11 = t**3 - t**2
+
+        return h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1
