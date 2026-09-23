@@ -8,6 +8,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-agents", type=int, default=2)
     parser.add_argument("--n-rounds", type=int, default=200)
+    parser.add_argument("--auction-type", type=str, default="first_price",
+                         choices=["first_price", "all_pay"])
     parser.add_argument("--sample-size", type=int, default=300_000)
     parser.add_argument("--belief-decay", type=float, default=0.9,
                          help="Fraction of each agent's belief buffer kept per update "
@@ -44,6 +46,7 @@ def main():
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.actor_hidden_size,
+        auction_type=args.auction_type,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

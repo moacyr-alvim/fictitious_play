@@ -46,9 +46,13 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.savefig(f"payoff{tag}.png", dpi=150)
     plt.close()
 
+    auction_type = trainer.auction_type
+    bid_formula = ("b*(v) = v*(N-1)/N" if auction_type == "first_price"
+                   else "b*(v) = v^N*(N-1)/N")
+
     v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
-        b_star = equilibrium_bid(v_grid, n_agents).squeeze(1).cpu()
+        b_star = equilibrium_bid(v_grid, n_agents, auction_type).squeeze(1).cpu()
         v_grid_cpu = v_grid.squeeze(1).cpu()
         bids = [trainer.agents[i](v_grid).squeeze(1).cpu() for i in range(n_agents)]
 
@@ -56,11 +60,11 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     for i, b in enumerate(bids):
         plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
     plt.plot(v_grid_cpu, b_star, "--", color="black",
-              label="Equilíbrio teórico b*(v) = v*(N-1)/N")
+              label=f"Equilíbrio teórico {bid_formula}")
     plt.xlabel("Valor v")
     plt.ylabel("Lance b")
     plt.legend()
-    plt.title("Estratégia de lance aprendida vs. equilíbrio")
+    plt.title(f"Estratégia de lance aprendida vs. equilíbrio ({auction_type})")
     plt.tight_layout()
     plt.savefig(f"bid_function{tag}.png", dpi=150)
     plt.close()
@@ -69,7 +73,7 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     b_grid = torch.linspace(0, 1, 300, device=trainer.device)
     with torch.no_grad():
         learned_p_win = critic.predict_win_prob(b_grid).cpu()
-        theoretical_p_win = theoretical_win_probability(b_grid, n_agents).cpu()
+        theoretical_p_win = theoretical_win_probability(b_grid, n_agents, auction_type).cpu()
 
     plt.figure()
     plt.plot(b_grid.cpu(), learned_p_win, label="Crítico aprendido (spline)")
@@ -77,7 +81,7 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.xlabel("Lance b")
     plt.ylabel("P(vitória | b)")
     plt.legend()
-    plt.title(f"Crítico do agente {critic_agent} (N={n_agents})")
+    plt.title(f"Crítico do agente {critic_agent} (N={n_agents}, {auction_type})")
     plt.tight_layout()
     plt.savefig(f"critic{tag}.png", dpi=150)
     plt.close()

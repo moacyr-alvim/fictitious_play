@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from .actor import Actor
-from .benchmark import equilibrium_bid, theoretical_expected_payoff
+from .benchmark import AUCTION_TYPES, equilibrium_bid, theoretical_expected_payoff
 from .critic import SplineCritic
 
 
@@ -53,12 +53,16 @@ class FictitiousPlayTrainer:
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
                  critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
+                 auction_type: str = "first_price",
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
                  seed: int | None = None, device: str | None = None):
         if freeze_mode not in ("none", "permanent", "temporary"):
             raise ValueError('freeze_mode must be "none", "permanent", or "temporary"')
+        if auction_type not in AUCTION_TYPES:
+            raise ValueError(f"auction_type must be one of {AUCTION_TYPES}")
+        self.auction_type = auction_type
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -172,7 +176,12 @@ class FictitiousPlayTrainer:
             v = torch.rand(self.batch_size, 1, device=self.device)
             b = actor(v)
             p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
-            loss = -((v - b) * p_win).mean()
+            if self.auction_type == "first_price":
+                # Payment only on winning: expected payoff = (v - b) * P(win | b).
+                loss = -((v - b) * p_win).mean()
+            else:
+                # all_pay: payment b is due regardless of the outcome.
+                loss = -(v * p_win - b).mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -198,7 +207,7 @@ class FictitiousPlayTrainer:
         region of valuations is still poorly fit — unlike an average."""
         with torch.no_grad():
             pred = actor(self.eval_grid)
-            target = equilibrium_bid(self.eval_grid, self.n_agents)
+            target = equilibrium_bid(self.eval_grid, self.n_agents, self.auction_type)
             diff = pred - target
             mse = torch.mean(diff ** 2).item()
             max_abs_diff = torch.max(torch.abs(diff)).item()
@@ -224,7 +233,10 @@ class FictitiousPlayTrainer:
             max_opp = b_opp.max(dim=1).values
 
             win = (b_self > max_opp).float()
-            payoff = win * (v_self.squeeze(1) - b_self)
+            if self.auction_type == "first_price":
+                payoff = win * (v_self.squeeze(1) - b_self)
+            else:
+                payoff = win * v_self.squeeze(1) - b_self
             return payoff.mean().item()
 
     def _max_diff_converged(self, max_diff: list[float]) -> bool:
@@ -260,6 +272,7 @@ class FictitiousPlayTrainer:
         torch.save({
             "round": round_idx,
             "n_agents": self.n_agents,
+            "auction_type": self.auction_type,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -295,6 +308,7 @@ class FictitiousPlayTrainer:
         self.belief_buffers = checkpoint["belief_buffers"]
         self.history = checkpoint["history"]
         self.growth_rounds = checkpoint.get("growth_rounds", [])
+        self.auction_type = checkpoint.get("auction_type", "first_price")
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
