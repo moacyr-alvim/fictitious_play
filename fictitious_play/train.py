@@ -32,13 +32,18 @@ class FictitiousPlayTrainer:
     n_rounds=200 with n_agents=4 means 50 best-response updates per agent.
 
     Training stops early (before n_rounds) as soon as either:
-      - every agent's MSE against the known equilibrium bid function drops
-        below mse_threshold, or
+      - every agent's *maximum* absolute deviation from the known
+        equilibrium bid function, over the evaluation grid, drops below
+        max_diff_threshold (a sup-norm check — unlike a mean-squared error,
+        it can't be satisfied while a whole region, e.g. high valuations,
+        is still off), or
       - every agent's expected payoff has changed by less than
         payoff_rel_tol (relative) between consecutive rounds, for the last
         payoff_stability_window rounds in a row (a benchmark-free proxy for
         "near equilibrium", useful when no closed-form equilibrium exists).
-    Either threshold can be set to None to disable that check.
+    Either threshold can be set to None to disable that check. The mean
+    squared error is still computed and logged every round as a diagnostic,
+    but no longer drives the stopping decision.
     """
 
     def __init__(self, n_agents: int = 2, n_rounds: int = 200, sample_size: int = 300_000,
@@ -46,7 +51,7 @@ class FictitiousPlayTrainer:
                  patience: int = 200, tol: float = 1e-6, lr: float = 1e-3,
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
-                 mse_threshold: float | None = 1e-3, payoff_rel_tol: float | None = 0.15,
+                 max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
                  seed: int | None = None, device: str | None = None):
@@ -60,7 +65,7 @@ class FictitiousPlayTrainer:
         self.ema_decay = ema_decay
         self.belief_decay = belief_decay
         self.payoff_eval_samples = payoff_eval_samples
-        self.mse_threshold = mse_threshold
+        self.max_diff_threshold = max_diff_threshold
         self.payoff_rel_tol = payoff_rel_tol
         self.payoff_stability_window = payoff_stability_window
         self.checkpoint_path = checkpoint_path
@@ -144,11 +149,19 @@ class FictitiousPlayTrainer:
 
         return steps_taken
 
-    def _benchmark_mse(self, actor: Actor) -> float:
+    def _benchmark_metrics(self, actor: Actor) -> tuple[float, float]:
+        """Returns (mse, max_abs_diff) of the actor's bid function against
+        the known equilibrium, over the evaluation grid. mse is logged only
+        as a diagnostic; max_abs_diff (the sup-norm deviation) drives the
+        stopping decision, since it cannot be satisfied while a whole
+        region of valuations is still poorly fit — unlike an average."""
         with torch.no_grad():
             pred = actor(self.eval_grid)
             target = equilibrium_bid(self.eval_grid, self.n_agents)
-            return torch.mean((pred - target) ** 2).item()
+            diff = pred - target
+            mse = torch.mean(diff ** 2).item()
+            max_abs_diff = torch.max(torch.abs(diff)).item()
+        return mse, max_abs_diff
 
     def _expected_payoff(self, agent_idx: int) -> float:
         """Monte Carlo expected payoff if the auction were run right now
@@ -173,10 +186,10 @@ class FictitiousPlayTrainer:
             payoff = win * (v_self.squeeze(1) - b_self)
             return payoff.mean().item()
 
-    def _mse_converged(self, mse: list[float]) -> bool:
-        if self.mse_threshold is None:
+    def _max_diff_converged(self, max_diff: list[float]) -> bool:
+        if self.max_diff_threshold is None:
             return False
-        return all(m < self.mse_threshold for m in mse)
+        return all(d <= self.max_diff_threshold for d in max_diff)
 
     def _payoff_converged(self) -> bool:
         if self.payoff_rel_tol is None:
@@ -232,30 +245,34 @@ class FictitiousPlayTrainer:
             steps_taken = self._best_response(mover_idx, critic)
             self._update_belief(mover_idx)
 
-            mse = [self._benchmark_mse(self.agents[i]) for i in range(self.n_agents)]
+            metrics = [self._benchmark_metrics(self.agents[i]) for i in range(self.n_agents)]
+            mse = [m[0] for m in metrics]
+            max_diff = [m[1] for m in metrics]
             payoff = [self._expected_payoff(i) for i in range(self.n_agents)]
             self.history.append({
                 "round": round_idx,
                 "mover": mover_idx,
                 "steps": steps_taken,
                 "mse": mse,
+                "max_diff": max_diff,
                 "payoff": payoff,
             })
             if verbose:
                 mse_str = " ".join(f"MSE{i}={m:.6f}" for i, m in enumerate(mse))
+                maxdiff_str = " ".join(f"MaxDiff{i}={d:.5f}" for i, d in enumerate(max_diff))
                 payoff_str = " ".join(f"P{i}={p:.5f}" for i, p in enumerate(payoff))
                 theo = theoretical_expected_payoff(self.n_agents)
                 print(f"Round {round_idx:3d} | mover=agent{mover_idx} | steps={steps_taken:5d} "
-                      f"| {mse_str} | {payoff_str} | teórico={theo:.5f}")
+                      f"| {mse_str} | {maxdiff_str} | {payoff_str} | teórico={theo:.5f}")
 
-            mse_ok = self._mse_converged(mse)
+            max_diff_ok = self._max_diff_converged(max_diff)
             payoff_ok = self._payoff_converged()
 
             if self.checkpoint_every and (round_idx + 1) % self.checkpoint_every == 0:
                 self.save_checkpoint(round_idx)
 
-            if mse_ok or payoff_ok:
-                reason = "MSE < limiar" if mse_ok else "payoff estável (janela)"
+            if max_diff_ok or payoff_ok:
+                reason = "desvio máximo < limiar" if max_diff_ok else "payoff estável (janela)"
                 if verbose:
                     print(f"Convergência detectada na rodada {round_idx} ({reason}).")
                 self.save_checkpoint(round_idx, converged=True)

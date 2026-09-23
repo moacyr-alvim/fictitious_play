@@ -12,9 +12,10 @@ def parse_args():
     parser.add_argument("--belief-decay", type=float, default=0.9,
                          help="Fraction of each agent's belief buffer kept per update "
                               "(0 = no memory / latest snapshot only).")
-    parser.add_argument("--mse-threshold", type=float, default=1e-3,
-                         help="Stop early once every agent's MSE against the equilibrium "
-                              "bid function drops below this. Use a negative value to disable.")
+    parser.add_argument("--max-diff-threshold", type=float, default=0.02,
+                         help="Stop early once every agent's maximum absolute deviation from "
+                              "the equilibrium bid function (over the eval grid) drops to or "
+                              "below this. Use a negative value to disable.")
     parser.add_argument("--payoff-rel-tol", type=float, default=0.15,
                          help="Stop early once every agent's expected payoff changes by less "
                               "than this fraction between consecutive rounds, sustained for "
@@ -37,7 +38,7 @@ def main():
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, belief_decay=args.belief_decay,
-        mse_threshold=args.mse_threshold if args.mse_threshold >= 0 else None,
+        max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
         checkpoint_path=checkpoint_path, checkpoint_every=args.checkpoint_every,
