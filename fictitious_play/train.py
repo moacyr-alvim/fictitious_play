@@ -51,7 +51,7 @@ class FictitiousPlayTrainer:
                  patience: int = 200, tol: float = 1e-6, lr: float = 1e-3,
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
-                 critic_n_quantiles: int = 400,
+                 critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -63,6 +63,7 @@ class FictitiousPlayTrainer:
         self.max_steps = max_steps
         self.patience = patience
         self.tol = tol
+        self.lr = lr
         self.ema_decay = ema_decay
         self.belief_decay = belief_decay
         self.payoff_eval_samples = payoff_eval_samples
@@ -81,16 +82,30 @@ class FictitiousPlayTrainer:
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-        self.agents = [Actor().to(self.device) for _ in range(n_agents)]
+        self.agents = [Actor(hidden_size=actor_hidden_size).to(self.device) for _ in range(n_agents)]
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=lr) for a in self.agents]
         self.belief_buffers = [self._fresh_bids(i) for i in range(n_agents)]
         self.history: list[dict] = []
+        self.growth_rounds: list[int] = []
 
     def _fresh_bids(self, agent_idx: int) -> np.ndarray:
         with torch.no_grad():
             v = torch.rand(self.sample_size, 1, device=self.device)
             b = self.agents[agent_idx](v)
         return b.squeeze(1).cpu().numpy()
+
+    def grow_agents(self, new_hidden_size: int) -> None:
+        """Grows every agent's actor to new_hidden_size hidden units,
+        function-preserving (see Actor.grow): each agent computes exactly
+        the same bids right after growing as right before. Optimizers are
+        rebuilt fresh for the new parameters (Adam's momentum/variance
+        state doesn't carry over meaning across a change in parameter
+        shape). Belief buffers and history are left untouched, since
+        they're just past bid values / metrics, independent of
+        architecture."""
+        self.agents = [agent.grow(new_hidden_size).to(self.device) for agent in self.agents]
+        self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
+        self.growth_rounds.append(len(self.history))
 
     def _update_belief(self, agent_idx: int) -> None:
         old = self.belief_buffers[agent_idx]
@@ -215,28 +230,45 @@ class FictitiousPlayTrainer:
             "round": round_idx,
             "n_agents": self.n_agents,
             "converged": converged,
+            "agent_hidden_sizes": [a.hidden_size for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
             "optimizers": [o.state_dict() for o in self.optimizers],
             "belief_buffers": self.belief_buffers,
             "history": self.history,
+            "growth_rounds": self.growth_rounds,
         }, self.checkpoint_path)
 
     def load_checkpoint(self, path: str | None = None) -> int:
         """Restores agents/optimizers/belief buffers/history from a
-        checkpoint saved by save_checkpoint. Returns the round it was
-        saved at (resume from round + 1)."""
+        checkpoint saved by save_checkpoint. Rebuilds each agent with the
+        hidden_size it had at save time (which may differ from this
+        trainer's current agents if growth happened), so this works
+        regardless of what hidden_size the trainer was constructed with.
+        Returns the round it was saved at."""
         checkpoint = torch.load(path or self.checkpoint_path, map_location=self.device,
                                  weights_only=False)
+
+        self.agents = [Actor(hidden_size=hs).to(self.device)
+                       for hs in checkpoint["agent_hidden_sizes"]]
         for actor, state in zip(self.agents, checkpoint["agents"]):
             actor.load_state_dict(state)
+
+        self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
         for optimizer, state in zip(self.optimizers, checkpoint["optimizers"]):
             optimizer.load_state_dict(state)
+
         self.belief_buffers = checkpoint["belief_buffers"]
         self.history = checkpoint["history"]
+        self.growth_rounds = checkpoint.get("growth_rounds", [])
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
-        for round_idx in range(self.n_rounds):
+        """Runs self.n_rounds more rounds, continuing round numbering (and
+        which agent moves next) from wherever self.history left off — so
+        calling run() again (e.g. after grow_agents()) resumes rather than
+        restarting the round count."""
+        start_round = len(self.history)
+        for round_idx in range(start_round, start_round + self.n_rounds):
             mover_idx = round_idx % self.n_agents
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 
@@ -280,6 +312,6 @@ class FictitiousPlayTrainer:
                 self.save_checkpoint(round_idx, converged=True)
                 break
         else:
-            self.save_checkpoint(self.n_rounds - 1, converged=False)
+            self.save_checkpoint(start_round + self.n_rounds - 1, converged=False)
 
         return self.history

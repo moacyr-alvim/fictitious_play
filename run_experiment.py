@@ -23,6 +23,9 @@ def parse_args():
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=400,
                          help="Number of quantile points the spline critic is fit on.")
+    parser.add_argument("--actor-hidden-size", type=int, default=32,
+                         help="Hidden units in the actor's single hidden layer (0 = no hidden "
+                              "layer, a constant shading factor).")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -40,7 +43,7 @@ def main():
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, belief_decay=args.belief_decay,
-        critic_n_quantiles=args.critic_n_quantiles,
+        critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.actor_hidden_size,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
@@ -50,7 +53,8 @@ def main():
     print(f"Device: {trainer.device}")
     history = trainer.run()
 
-    save_all_plots(trainer, history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent)
+    save_all_plots(trainer, history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent,
+                    growth_rounds=trainer.growth_rounds)
 
 
 if __name__ == "__main__":

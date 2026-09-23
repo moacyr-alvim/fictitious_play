@@ -5,14 +5,22 @@ from .benchmark import equilibrium_bid, theoretical_expected_payoff, theoretical
 from .train import FictitiousPlayTrainer
 
 
+def _mark_growth_stages(growth_rounds: list[int] | None) -> None:
+    for i, r in enumerate(growth_rounds or []):
+        plt.axvline(r, color="gray", linestyle=":", alpha=0.7,
+                    label="Crescimento da rede" if i == 0 else None)
+
+
 def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
-                    n_agents: int, tag: str = "", critic_agent: int = 0) -> None:
+                    n_agents: int, tag: str = "", critic_agent: int = 0,
+                    growth_rounds: list[int] | None = None) -> None:
     rounds = [h["round"] for h in history]
     mse_per_agent = list(zip(*(h["mse"] for h in history)))
 
     plt.figure()
     for i, mse_series in enumerate(mse_per_agent):
         plt.plot(rounds, mse_series, label=f"Agente {i}")
+    _mark_growth_stages(growth_rounds)
     plt.yscale("log")
     plt.xlabel("Rodada")
     plt.ylabel("MSE vs. equilíbrio teórico (escala log)")
@@ -29,6 +37,7 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     for i, payoff_series in enumerate(payoff_per_agent):
         plt.plot(rounds, payoff_series, label=f"Agente {i}")
     plt.axhline(theo_payoff, color="black", linestyle="--", label="Payoff teórico")
+    _mark_growth_stages(growth_rounds)
     plt.xlabel("Rodada")
     plt.ylabel("Payoff médio esperado")
     plt.legend()

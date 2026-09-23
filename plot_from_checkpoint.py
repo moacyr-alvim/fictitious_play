@@ -19,7 +19,8 @@ def main():
     round_idx = trainer.load_checkpoint(args.checkpoint)
     print(f"Checkpoint carregado (rodada {round_idx}, {len(trainer.history)} rodadas no histórico)")
 
-    save_all_plots(trainer, trainer.history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent)
+    save_all_plots(trainer, trainer.history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent,
+                    growth_rounds=trainer.growth_rounds)
 
 
 if __name__ == "__main__":
