@@ -52,10 +52,13 @@ class FictitiousPlayTrainer:
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
                  critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
+                 freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
                  seed: int | None = None, device: str | None = None):
+        if freeze_mode not in ("none", "permanent", "temporary"):
+            raise ValueError('freeze_mode must be "none", "permanent", or "temporary"')
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -68,6 +71,8 @@ class FictitiousPlayTrainer:
         self.belief_decay = belief_decay
         self.payoff_eval_samples = payoff_eval_samples
         self.critic_n_quantiles = critic_n_quantiles
+        self.freeze_mode = freeze_mode
+        self.unfreeze_after_rounds = unfreeze_after_rounds
         self.max_diff_threshold = max_diff_threshold
         self.payoff_rel_tol = payoff_rel_tol
         self.payoff_stability_window = payoff_stability_window
@@ -87,6 +92,7 @@ class FictitiousPlayTrainer:
         self.belief_buffers = [self._fresh_bids(i) for i in range(n_agents)]
         self.history: list[dict] = []
         self.growth_rounds: list[int] = []
+        self._frozen_since_round: int | None = None
 
     def _fresh_bids(self, agent_idx: int) -> np.ndarray:
         with torch.no_grad():
@@ -95,17 +101,35 @@ class FictitiousPlayTrainer:
         return b.squeeze(1).cpu().numpy()
 
     def grow_agents(self, new_hidden_size: int) -> None:
-        """Grows every agent's actor to new_hidden_size hidden units,
-        function-preserving (see Actor.grow): each agent computes exactly
-        the same bids right after growing as right before. Optimizers are
-        rebuilt fresh for the new parameters (Adam's momentum/variance
-        state doesn't carry over meaning across a change in parameter
-        shape). Belief buffers and history are left untouched, since
-        they're just past bid values / metrics, independent of
-        architecture."""
-        self.agents = [agent.grow(new_hidden_size).to(self.device) for agent in self.agents]
+        """Grows every agent's actor to new_hidden_size hidden units (all
+        agents share the same current hidden_size, so the same increment
+        applies to each), function-preserving (see Actor.grow): each agent
+        computes exactly the same bids right after growing as right before.
+        Optimizers are rebuilt fresh for the new parameters (Adam's
+        momentum/variance state doesn't carry over meaning across a change
+        in parameter shape). Belief buffers and history are left untouched,
+        since they're just past bid values / metrics, independent of
+        architecture.
+
+        freeze_mode="permanent" makes every parameter from before this call
+        (and every earlier growth stage) permanently non-trainable, so only
+        the newest block can still move. freeze_mode="temporary" does the
+        same, but run() automatically unfreezes everything again after
+        unfreeze_after_rounds rounds."""
+        additional = new_hidden_size - self.agents[0].hidden_size
+        freeze = self.freeze_mode in ("permanent", "temporary")
+        self.agents = [agent.grow(additional, freeze_previous=freeze).to(self.device)
+                       for agent in self.agents]
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
         self.growth_rounds.append(len(self.history))
+        self._frozen_since_round = len(self.history) if freeze else None
+
+    def _maybe_unfreeze(self, round_idx: int) -> None:
+        if (self.freeze_mode == "temporary" and self._frozen_since_round is not None
+                and round_idx - self._frozen_since_round >= self.unfreeze_after_rounds):
+            for agent in self.agents:
+                agent.unfreeze_all()
+            self._frozen_since_round = None
 
     def _update_belief(self, agent_idx: int) -> None:
         old = self.belief_buffers[agent_idx]
@@ -237,7 +261,7 @@ class FictitiousPlayTrainer:
             "round": round_idx,
             "n_agents": self.n_agents,
             "converged": converged,
-            "agent_hidden_sizes": [a.hidden_size for a in self.agents],
+            "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
             "optimizers": [o.state_dict() for o in self.optimizers],
             "belief_buffers": self.belief_buffers,
@@ -248,15 +272,19 @@ class FictitiousPlayTrainer:
     def load_checkpoint(self, path: str | None = None) -> int:
         """Restores agents/optimizers/belief buffers/history from a
         checkpoint saved by save_checkpoint. Rebuilds each agent with the
-        hidden_size it had at save time (which may differ from this
-        trainer's current agents if growth happened), so this works
-        regardless of what hidden_size the trainer was constructed with.
-        Returns the round it was saved at."""
+        same block structure it had at save time (which may differ from
+        this trainer's current agents if growth happened), so this works
+        regardless of what the trainer was constructed with. Returns the
+        round it was saved at."""
         checkpoint = torch.load(path or self.checkpoint_path, map_location=self.device,
                                  weights_only=False)
 
-        self.agents = [Actor(hidden_size=hs).to(self.device)
-                       for hs in checkpoint["agent_hidden_sizes"]]
+        self.agents = []
+        for widths in checkpoint["agent_block_widths"]:
+            agent = Actor(hidden_size=0)
+            for width in widths:
+                agent.grow(width)
+            self.agents.append(agent.to(self.device))
         for actor, state in zip(self.agents, checkpoint["agents"]):
             actor.load_state_dict(state)
 
@@ -276,6 +304,7 @@ class FictitiousPlayTrainer:
         restarting the round count."""
         start_round = len(self.history)
         for round_idx in range(start_round, start_round + self.n_rounds):
+            self._maybe_unfreeze(round_idx)
             mover_idx = round_idx % self.n_agents
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 

@@ -19,6 +19,14 @@ def parse_args():
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=1000)
+    parser.add_argument("--freeze-mode", type=str, default="none",
+                         choices=["none", "permanent", "temporary"],
+                         help="What happens to previously-trained parameters when the actor "
+                              "grows: keep training them jointly (none), lock them forever "
+                              "(permanent), or lock them for --unfreeze-after-rounds rounds "
+                              "then resume joint training (temporary).")
+    parser.add_argument("--unfreeze-after-rounds", type=int, default=20,
+                         help="Only used with --freeze-mode temporary.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -37,6 +45,7 @@ def main():
         n_agents=args.n_agents, n_rounds=args.rounds_per_stage,
         sample_size=args.sample_size, belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.stages[0],
+        freeze_mode=args.freeze_mode, unfreeze_after_rounds=args.unfreeze_after_rounds,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
