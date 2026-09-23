@@ -209,12 +209,19 @@ class FictitiousPlayTrainer:
         return all(d <= self.max_diff_threshold for d in max_diff)
 
     def _payoff_converged(self) -> bool:
+        """Stability is judged only on rounds since the current stage
+        started (i.e. since the last grow_agents() call, if any): growth
+        is function-preserving, so payoff readings from just before growing
+        would otherwise look "stable" together with the readings right
+        after, letting a stage stop before its new capacity did anything."""
         if self.payoff_rel_tol is None:
             return False
-        if len(self.history) < self.payoff_stability_window + 1:
+        stage_start = self.growth_rounds[-1] if self.growth_rounds else 0
+        stage_history = self.history[stage_start:]
+        if len(stage_history) < self.payoff_stability_window + 1:
             return False
 
-        recent = [h["payoff"] for h in self.history[-(self.payoff_stability_window + 1):]]
+        recent = [h["payoff"] for h in stage_history[-(self.payoff_stability_window + 1):]]
         for prev, curr in zip(recent, recent[1:]):
             for p_prev, p_curr in zip(prev, curr):
                 denom = abs(p_prev) if abs(p_prev) > 1e-12 else 1e-12
