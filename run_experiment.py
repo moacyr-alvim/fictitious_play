@@ -1,13 +1,6 @@
 import argparse
 
-import matplotlib.pyplot as plt
-import torch
-
-from fictitious_play.benchmark import (
-    equilibrium_bid,
-    theoretical_expected_payoff,
-    theoretical_win_probability,
-)
+from fictitious_play.plotting import save_all_plots
 from fictitious_play.train import FictitiousPlayTrainer
 
 
@@ -19,87 +12,41 @@ def parse_args():
     parser.add_argument("--belief-decay", type=float, default=0.9,
                          help="Fraction of each agent's belief buffer kept per update "
                               "(0 = no memory / latest snapshot only).")
+    parser.add_argument("--mse-threshold", type=float, default=1e-3,
+                         help="Stop early once every agent's MSE against the equilibrium "
+                              "bid function drops below this. Use a negative value to disable.")
+    parser.add_argument("--payoff-rel-tol", type=float, default=0.15,
+                         help="Stop early once every agent's expected payoff changes by less "
+                              "than this fraction between consecutive rounds, sustained for "
+                              "--payoff-window rounds. Use a negative value to disable.")
+    parser.add_argument("--payoff-window", type=int, default=10)
+    parser.add_argument("--checkpoint-every", type=int, default=20,
+                         help="Save a checkpoint every this many rounds (0 disables periodic "
+                              "checkpointing; a final checkpoint is always saved).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--critic-agent", type=int, default=0,
                          help="Which agent's critic to plot.")
     parser.add_argument("--tag", type=str, default="",
-                         help="Suffix appended to output figure filenames.")
+                         help="Suffix appended to output figure/checkpoint filenames.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    checkpoint_path = f"checkpoints/checkpoint{args.tag}.pt"
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
-        sample_size=args.sample_size, belief_decay=args.belief_decay, seed=args.seed,
+        sample_size=args.sample_size, belief_decay=args.belief_decay,
+        mse_threshold=args.mse_threshold if args.mse_threshold >= 0 else None,
+        payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
+        payoff_stability_window=args.payoff_window,
+        checkpoint_path=checkpoint_path, checkpoint_every=args.checkpoint_every,
+        seed=args.seed,
     )
     print(f"Device: {trainer.device}")
     history = trainer.run()
 
-    rounds = [h["round"] for h in history]
-    mse_per_agent = list(zip(*(h["mse"] for h in history)))
-
-    plt.figure()
-    for i, mse_series in enumerate(mse_per_agent):
-        plt.plot(rounds, mse_series, label=f"Agente {i}")
-    plt.yscale("log")
-    plt.xlabel("Rodada")
-    plt.ylabel("MSE vs. equilíbrio teórico (escala log)")
-    plt.legend()
-    plt.title(f"Convergência ao equilíbrio de Bayes-Nash (N={args.n_agents})")
-    plt.tight_layout()
-    plt.savefig(f"convergence{args.tag}.png", dpi=150)
-
-    payoff_per_agent = list(zip(*(h["payoff"] for h in history)))
-    theo_payoff = theoretical_expected_payoff(args.n_agents)
-
-    plt.figure()
-    for i, payoff_series in enumerate(payoff_per_agent):
-        plt.plot(rounds, payoff_series, label=f"Agente {i}")
-    plt.axhline(theo_payoff, color="black", linestyle="--", label="Payoff teórico")
-    plt.xlabel("Rodada")
-    plt.ylabel("Payoff médio esperado")
-    plt.legend()
-    plt.title(f"Payoff médio esperado vs. teórico (N={args.n_agents})")
-    plt.tight_layout()
-    plt.savefig(f"payoff{args.tag}.png", dpi=150)
-
-    v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
-    with torch.no_grad():
-        b_star = equilibrium_bid(v_grid, args.n_agents).squeeze(1).cpu()
-        v_grid_cpu = v_grid.squeeze(1).cpu()
-        bids = [trainer.agents[i](v_grid).squeeze(1).cpu() for i in range(args.n_agents)]
-
-    plt.figure()
-    for i, b in enumerate(bids):
-        plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
-    plt.plot(v_grid_cpu, b_star, "--", color="black",
-              label=f"Equilíbrio teórico b*(v) = v*(N-1)/N")
-    plt.xlabel("Valor v")
-    plt.ylabel("Lance b")
-    plt.legend()
-    plt.title("Estratégia de lance aprendida vs. equilíbrio")
-    plt.tight_layout()
-    plt.savefig(f"bid_function{args.tag}.png", dpi=150)
-
-    critic = trainer.critic_for(args.critic_agent)
-    b_grid = torch.linspace(0, 1, 300, device=trainer.device)
-    with torch.no_grad():
-        learned_p_win = critic.predict_win_prob(b_grid).cpu()
-        theoretical_p_win = theoretical_win_probability(b_grid, args.n_agents).cpu()
-
-    plt.figure()
-    plt.plot(b_grid.cpu(), learned_p_win, label="Crítico aprendido (KDE)")
-    plt.plot(b_grid.cpu(), theoretical_p_win, "--", color="black", label="P(vitória|b) teórica")
-    plt.xlabel("Lance b")
-    plt.ylabel("P(vitória | b)")
-    plt.legend()
-    plt.title(f"Crítico do agente {args.critic_agent} (N={args.n_agents})")
-    plt.tight_layout()
-    plt.savefig(f"critic{args.tag}.png", dpi=150)
-
-    print(f"Figuras salvas em convergence{args.tag}.png, payoff{args.tag}.png, "
-          f"bid_function{args.tag}.png e critic{args.tag}.png")
+    save_all_plots(trainer, history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent)
 
 
 if __name__ == "__main__":

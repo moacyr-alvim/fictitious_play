@@ -1,4 +1,5 @@
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -29,6 +30,15 @@ class FictitiousPlayTrainer:
     plateaus (or max_steps is reached, as a safety cap), and then its own
     belief buffer is refreshed. Agents take turns round-robin, so
     n_rounds=200 with n_agents=4 means 50 best-response updates per agent.
+
+    Training stops early (before n_rounds) as soon as either:
+      - every agent's MSE against the known equilibrium bid function drops
+        below mse_threshold, or
+      - every agent's expected payoff has changed by less than
+        payoff_rel_tol (relative) between consecutive rounds, for the last
+        payoff_stability_window rounds in a row (a benchmark-free proxy for
+        "near equilibrium", useful when no closed-form equilibrium exists).
+    Either threshold can be set to None to disable that check.
     """
 
     def __init__(self, n_agents: int = 2, n_rounds: int = 200, sample_size: int = 300_000,
@@ -36,6 +46,9 @@ class FictitiousPlayTrainer:
                  patience: int = 200, tol: float = 1e-6, lr: float = 1e-3,
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
+                 mse_threshold: float | None = 1e-3, payoff_rel_tol: float | None = 0.15,
+                 payoff_stability_window: int = 10,
+                 checkpoint_path: str | None = None, checkpoint_every: int = 20,
                  seed: int | None = None, device: str | None = None):
         self.n_agents = n_agents
         self.n_rounds = n_rounds
@@ -47,6 +60,11 @@ class FictitiousPlayTrainer:
         self.ema_decay = ema_decay
         self.belief_decay = belief_decay
         self.payoff_eval_samples = payoff_eval_samples
+        self.mse_threshold = mse_threshold
+        self.payoff_rel_tol = payoff_rel_tol
+        self.payoff_stability_window = payoff_stability_window
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_every = checkpoint_every
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -155,6 +173,53 @@ class FictitiousPlayTrainer:
             payoff = win * (v_self.squeeze(1) - b_self)
             return payoff.mean().item()
 
+    def _mse_converged(self, mse: list[float]) -> bool:
+        if self.mse_threshold is None:
+            return False
+        return all(m < self.mse_threshold for m in mse)
+
+    def _payoff_converged(self) -> bool:
+        if self.payoff_rel_tol is None:
+            return False
+        if len(self.history) < self.payoff_stability_window + 1:
+            return False
+
+        recent = [h["payoff"] for h in self.history[-(self.payoff_stability_window + 1):]]
+        for prev, curr in zip(recent, recent[1:]):
+            for p_prev, p_curr in zip(prev, curr):
+                denom = abs(p_prev) if abs(p_prev) > 1e-12 else 1e-12
+                if abs(p_curr - p_prev) / denom >= self.payoff_rel_tol:
+                    return False
+        return True
+
+    def save_checkpoint(self, round_idx: int, converged: bool = False) -> None:
+        if self.checkpoint_path is None:
+            return
+        Path(self.checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "round": round_idx,
+            "n_agents": self.n_agents,
+            "converged": converged,
+            "agents": [a.state_dict() for a in self.agents],
+            "optimizers": [o.state_dict() for o in self.optimizers],
+            "belief_buffers": self.belief_buffers,
+            "history": self.history,
+        }, self.checkpoint_path)
+
+    def load_checkpoint(self, path: str | None = None) -> int:
+        """Restores agents/optimizers/belief buffers/history from a
+        checkpoint saved by save_checkpoint. Returns the round it was
+        saved at (resume from round + 1)."""
+        checkpoint = torch.load(path or self.checkpoint_path, map_location=self.device,
+                                 weights_only=False)
+        for actor, state in zip(self.agents, checkpoint["agents"]):
+            actor.load_state_dict(state)
+        for optimizer, state in zip(self.optimizers, checkpoint["optimizers"]):
+            optimizer.load_state_dict(state)
+        self.belief_buffers = checkpoint["belief_buffers"]
+        self.history = checkpoint["history"]
+        return checkpoint["round"]
+
     def run(self, verbose: bool = True) -> list[dict]:
         for round_idx in range(self.n_rounds):
             mover_idx = round_idx % self.n_agents
@@ -182,5 +247,20 @@ class FictitiousPlayTrainer:
                 theo = theoretical_expected_payoff(self.n_agents)
                 print(f"Round {round_idx:3d} | mover=agent{mover_idx} | steps={steps_taken:5d} "
                       f"| {mse_str} | {payoff_str} | teórico={theo:.5f}")
+
+            mse_ok = self._mse_converged(mse)
+            payoff_ok = self._payoff_converged()
+
+            if self.checkpoint_every and (round_idx + 1) % self.checkpoint_every == 0:
+                self.save_checkpoint(round_idx)
+
+            if mse_ok or payoff_ok:
+                reason = "MSE < limiar" if mse_ok else "payoff estável (janela)"
+                if verbose:
+                    print(f"Convergência detectada na rodada {round_idx} ({reason}).")
+                self.save_checkpoint(round_idx, converged=True)
+                break
+        else:
+            self.save_checkpoint(self.n_rounds - 1, converged=False)
 
         return self.history
