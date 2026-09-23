@@ -3,7 +3,11 @@ import argparse
 import matplotlib.pyplot as plt
 import torch
 
-from fictitious_play.benchmark import equilibrium_bid, theoretical_win_probability
+from fictitious_play.benchmark import (
+    equilibrium_bid,
+    theoretical_expected_payoff,
+    theoretical_win_probability,
+)
 from fictitious_play.train import FictitiousPlayTrainer
 
 
@@ -12,6 +16,9 @@ def parse_args():
     parser.add_argument("--n-agents", type=int, default=2)
     parser.add_argument("--n-rounds", type=int, default=200)
     parser.add_argument("--sample-size", type=int, default=300_000)
+    parser.add_argument("--belief-decay", type=float, default=0.9,
+                         help="Fraction of each agent's belief buffer kept per update "
+                              "(0 = no memory / latest snapshot only).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--critic-agent", type=int, default=0,
                          help="Which agent's critic to plot.")
@@ -24,7 +31,7 @@ def main():
     args = parse_args()
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
-        sample_size=args.sample_size, seed=args.seed,
+        sample_size=args.sample_size, belief_decay=args.belief_decay, seed=args.seed,
     )
     print(f"Device: {trainer.device}")
     history = trainer.run()
@@ -42,6 +49,20 @@ def main():
     plt.title(f"Convergência ao equilíbrio de Bayes-Nash (N={args.n_agents})")
     plt.tight_layout()
     plt.savefig(f"convergence{args.tag}.png", dpi=150)
+
+    payoff_per_agent = list(zip(*(h["payoff"] for h in history)))
+    theo_payoff = theoretical_expected_payoff(args.n_agents)
+
+    plt.figure()
+    for i, payoff_series in enumerate(payoff_per_agent):
+        plt.plot(rounds, payoff_series, label=f"Agente {i}")
+    plt.axhline(theo_payoff, color="black", linestyle="--", label="Payoff teórico")
+    plt.xlabel("Rodada")
+    plt.ylabel("Payoff médio esperado")
+    plt.legend()
+    plt.title(f"Payoff médio esperado vs. teórico (N={args.n_agents})")
+    plt.tight_layout()
+    plt.savefig(f"payoff{args.tag}.png", dpi=150)
 
     v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
@@ -77,7 +98,8 @@ def main():
     plt.tight_layout()
     plt.savefig(f"critic{args.tag}.png", dpi=150)
 
-    print(f"Figuras salvas em convergence{args.tag}.png, bid_function{args.tag}.png e critic{args.tag}.png")
+    print(f"Figuras salvas em convergence{args.tag}.png, payoff{args.tag}.png, "
+          f"bid_function{args.tag}.png e critic{args.tag}.png")
 
 
 if __name__ == "__main__":
