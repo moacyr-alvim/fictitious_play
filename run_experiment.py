@@ -21,6 +21,8 @@ def parse_args():
                               "than this fraction between consecutive rounds, sustained for "
                               "--payoff-window rounds. Use a negative value to disable.")
     parser.add_argument("--payoff-window", type=int, default=10)
+    parser.add_argument("--critic-n-quantiles", type=int, default=400,
+                         help="Number of quantile points the spline critic is fit on.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -38,6 +40,7 @@ def main():
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, belief_decay=args.belief_decay,
+        critic_n_quantiles=args.critic_n_quantiles,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

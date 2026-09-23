@@ -51,6 +51,7 @@ class FictitiousPlayTrainer:
                  patience: int = 200, tol: float = 1e-6, lr: float = 1e-3,
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
+                 critic_n_quantiles: int = 400,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -65,6 +66,7 @@ class FictitiousPlayTrainer:
         self.ema_decay = ema_decay
         self.belief_decay = belief_decay
         self.payoff_eval_samples = payoff_eval_samples
+        self.critic_n_quantiles = critic_n_quantiles
         self.max_diff_threshold = max_diff_threshold
         self.payoff_rel_tol = payoff_rel_tol
         self.payoff_stability_window = payoff_stability_window
@@ -115,7 +117,7 @@ class FictitiousPlayTrainer:
         belief buffers."""
         opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
         opponent_bids = self._sample_max_belief_bids(opponent_indices)
-        critic = SplineCritic(device=self.device)
+        critic = SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
         critic.fit(opponent_bids)
         return critic
 
@@ -239,7 +241,7 @@ class FictitiousPlayTrainer:
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 
             opponent_bids = self._sample_max_belief_bids(opponent_indices)
-            critic = SplineCritic(device=self.device)
+            critic = SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
             critic.fit(opponent_bids)
 
             steps_taken = self._best_response(mover_idx, critic)
