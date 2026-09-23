@@ -15,6 +15,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--critic-agent", type=int, default=0,
                          help="Which agent's critic to plot.")
+    parser.add_argument("--tag", type=str, default="",
+                         help="Suffix appended to output figure filenames.")
     return parser.parse_args()
 
 
@@ -39,7 +41,7 @@ def main():
     plt.legend()
     plt.title(f"Convergência ao equilíbrio de Bayes-Nash (N={args.n_agents})")
     plt.tight_layout()
-    plt.savefig("convergence.png", dpi=150)
+    plt.savefig(f"convergence{args.tag}.png", dpi=150)
 
     v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
@@ -57,7 +59,7 @@ def main():
     plt.legend()
     plt.title("Estratégia de lance aprendida vs. equilíbrio")
     plt.tight_layout()
-    plt.savefig("bid_function.png", dpi=150)
+    plt.savefig(f"bid_function{args.tag}.png", dpi=150)
 
     critic = trainer.critic_for(args.critic_agent)
     b_grid = torch.linspace(0, 1, 300, device=trainer.device)
@@ -73,9 +75,9 @@ def main():
     plt.legend()
     plt.title(f"Crítico do agente {args.critic_agent} (N={args.n_agents})")
     plt.tight_layout()
-    plt.savefig("critic.png", dpi=150)
+    plt.savefig(f"critic{args.tag}.png", dpi=150)
 
-    print("Figuras salvas em convergence.png, bid_function.png e critic.png")
+    print(f"Figuras salvas em convergence{args.tag}.png, bid_function{args.tag}.png e critic{args.tag}.png")
 
 
 if __name__ == "__main__":
