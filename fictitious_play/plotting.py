@@ -75,7 +75,6 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
         plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
     plt.plot(v_grid_cpu, b_star, "--", color="black",
               label=f"Equilíbrio teórico {bid_formula}")
-    _mark_growth_stages(growth_rounds)
     plt.xlabel("Valor v")
     plt.ylabel("Lance b")
     plt.legend()
