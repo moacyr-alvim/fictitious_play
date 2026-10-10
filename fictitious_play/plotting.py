@@ -1,7 +1,13 @@
 import matplotlib.pyplot as plt
 import torch
 
-from .benchmark import equilibrium_bid, theoretical_expected_payoff, theoretical_win_probability
+from .benchmark import (
+    equilibrium_bid,
+    equilibrium_bid_lambda,
+    theoretical_expected_payoff,
+    theoretical_win_probability,
+    theoretical_win_probability_lambda,
+)
 from .train import FictitiousPlayTrainer
 
 
@@ -46,13 +52,21 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.savefig(f"payoff{tag}.png", dpi=150)
     plt.close()
 
-    auction_type = trainer.auction_type
-    bid_formula = ("b*(v) = v*(N-1)/N" if auction_type == "first_price"
-                   else "b*(v) = v^N*(N-1)/N")
+    payment_share = trainer.payment_share
+    if payment_share is not None:
+        label_suffix = f"payment_share={payment_share:.2f}"
+        bid_formula = f"b*(v) = (N-1)v^N / (N*[(1-{payment_share:.2f})v^(N-1)+{payment_share:.2f}])"
+    else:
+        label_suffix = trainer.auction_type
+        bid_formula = ("b*(v) = v*(N-1)/N" if trainer.auction_type == "first_price"
+                       else "b*(v) = v^N*(N-1)/N")
 
     v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
-        b_star = equilibrium_bid(v_grid, n_agents, auction_type).squeeze(1).cpu()
+        if payment_share is not None:
+            b_star = equilibrium_bid_lambda(v_grid, n_agents, payment_share).squeeze(1).cpu()
+        else:
+            b_star = equilibrium_bid(v_grid, n_agents, trainer.auction_type).squeeze(1).cpu()
         v_grid_cpu = v_grid.squeeze(1).cpu()
         bids = [trainer.agents[i](v_grid).squeeze(1).cpu() for i in range(n_agents)]
 
@@ -61,10 +75,11 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
         plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
     plt.plot(v_grid_cpu, b_star, "--", color="black",
               label=f"Equilíbrio teórico {bid_formula}")
+    _mark_growth_stages(growth_rounds)
     plt.xlabel("Valor v")
     plt.ylabel("Lance b")
     plt.legend()
-    plt.title(f"Estratégia de lance aprendida vs. equilíbrio ({auction_type})")
+    plt.title(f"Estratégia de lance aprendida vs. equilíbrio ({label_suffix})")
     plt.tight_layout()
     plt.savefig(f"bid_function{tag}.png", dpi=150)
     plt.close()
@@ -73,7 +88,10 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     b_grid = torch.linspace(0, 1, 300, device=trainer.device)
     with torch.no_grad():
         learned_p_win = critic.predict_win_prob(b_grid).cpu()
-        theoretical_p_win = theoretical_win_probability(b_grid, n_agents, auction_type).cpu()
+        if payment_share is not None:
+            theoretical_p_win = theoretical_win_probability_lambda(b_grid, n_agents, payment_share).cpu()
+        else:
+            theoretical_p_win = theoretical_win_probability(b_grid, n_agents, trainer.auction_type).cpu()
 
     plt.figure()
     plt.plot(b_grid.cpu(), learned_p_win, label="Crítico aprendido (spline)")
@@ -81,7 +99,7 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.xlabel("Lance b")
     plt.ylabel("P(vitória | b)")
     plt.legend()
-    plt.title(f"Crítico do agente {critic_agent} (N={n_agents}, {auction_type})")
+    plt.title(f"Crítico do agente {critic_agent} (N={n_agents}, {label_suffix})")
     plt.tight_layout()
     plt.savefig(f"critic{tag}.png", dpi=150)
     plt.close()

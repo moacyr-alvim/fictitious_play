@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from .actor import Actor
-from .benchmark import AUCTION_TYPES, equilibrium_bid, theoretical_expected_payoff
+from .benchmark import AUCTION_TYPES, equilibrium_bid, equilibrium_bid_lambda, theoretical_expected_payoff
 from .critic import SplineCritic
 
 
@@ -53,7 +53,7 @@ class FictitiousPlayTrainer:
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
                  critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
-                 auction_type: str = "first_price",
+                 auction_type: str = "first_price", payment_share: float | None = None,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -63,6 +63,12 @@ class FictitiousPlayTrainer:
         if auction_type not in AUCTION_TYPES:
             raise ValueError(f"auction_type must be one of {AUCTION_TYPES}")
         self.auction_type = auction_type
+        # payment_share (lambda), when set, overrides auction_type: it drives
+        # the generalized payment rule that interpolates between first-price
+        # (0.0) and all-pay (1.0) — see benchmark.equilibrium_bid_lambda. Used
+        # for homotopy continuation: step payment_share from 0 to 1 across
+        # training stages, warm-starting each stage from the previous one.
+        self.payment_share = payment_share
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -128,6 +134,17 @@ class FictitiousPlayTrainer:
         self.growth_rounds.append(len(self.history))
         self._frozen_since_round = len(self.history) if freeze else None
 
+    def set_payment_share(self, new_payment_share: float) -> None:
+        """Moves to a new point on the first-price <-> all-pay continuum
+        (see benchmark.equilibrium_bid_lambda). Unlike grow_agents, this
+        doesn't touch the actors' parameters at all — the warm start is
+        implicit, since the payoff landscape changes continuously with
+        payment_share and training simply continues from wherever the
+        agents already are. Marked as a stage boundary on plots the same
+        way network growth is (shares growth_rounds)."""
+        self.payment_share = new_payment_share
+        self.growth_rounds.append(len(self.history))
+
     def _maybe_unfreeze(self, round_idx: int) -> None:
         if (self.freeze_mode == "temporary" and self._frozen_since_round is not None
                 and round_idx - self._frozen_since_round >= self.unfreeze_after_rounds):
@@ -176,7 +193,12 @@ class FictitiousPlayTrainer:
             v = torch.rand(self.batch_size, 1, device=self.device)
             b = actor(v)
             p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
-            if self.auction_type == "first_price":
+            if self.payment_share is not None:
+                # Generalized payment rule: winner pays b, losers pay
+                # payment_share * b. E[payoff] = P(win)*(v - (1-share)*b) - share*b.
+                lam = self.payment_share
+                loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
+            elif self.auction_type == "first_price":
                 # Payment only on winning: expected payoff = (v - b) * P(win | b).
                 loss = -((v - b) * p_win).mean()
             else:
@@ -207,7 +229,10 @@ class FictitiousPlayTrainer:
         region of valuations is still poorly fit — unlike an average."""
         with torch.no_grad():
             pred = actor(self.eval_grid)
-            target = equilibrium_bid(self.eval_grid, self.n_agents, self.auction_type)
+            if self.payment_share is not None:
+                target = equilibrium_bid_lambda(self.eval_grid, self.n_agents, self.payment_share)
+            else:
+                target = equilibrium_bid(self.eval_grid, self.n_agents, self.auction_type)
             diff = pred - target
             mse = torch.mean(diff ** 2).item()
             max_abs_diff = torch.max(torch.abs(diff)).item()
@@ -233,10 +258,14 @@ class FictitiousPlayTrainer:
             max_opp = b_opp.max(dim=1).values
 
             win = (b_self > max_opp).float()
-            if self.auction_type == "first_price":
-                payoff = win * (v_self.squeeze(1) - b_self)
+            v_flat = v_self.squeeze(1)
+            if self.payment_share is not None:
+                lam = self.payment_share
+                payoff = win * (v_flat - b_self) - (1 - win) * lam * b_self
+            elif self.auction_type == "first_price":
+                payoff = win * (v_flat - b_self)
             else:
-                payoff = win * v_self.squeeze(1) - b_self
+                payoff = win * v_flat - b_self
             return payoff.mean().item()
 
     def _max_diff_converged(self, max_diff: list[float]) -> bool:
@@ -273,6 +302,7 @@ class FictitiousPlayTrainer:
             "round": round_idx,
             "n_agents": self.n_agents,
             "auction_type": self.auction_type,
+            "payment_share": self.payment_share,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -309,6 +339,7 @@ class FictitiousPlayTrainer:
         self.history = checkpoint["history"]
         self.growth_rounds = checkpoint.get("growth_rounds", [])
         self.auction_type = checkpoint.get("auction_type", "first_price")
+        self.payment_share = checkpoint.get("payment_share")
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
