@@ -11,6 +11,8 @@ def parse_args():
     parser.add_argument("--auction-type", type=str, default="first_price",
                          choices=["first_price", "all_pay"])
     parser.add_argument("--sample-size", type=int, default=300_000)
+    parser.add_argument("--patience", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=20_000)
     parser.add_argument("--belief-decay", type=float, default=0.9,
                          help="Fraction of each agent's belief buffer kept per update "
                               "(0 = no memory / latest snapshot only).")
@@ -49,7 +51,8 @@ def main():
     checkpoint_path = f"checkpoints/checkpoint{args.tag}.pt"
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
-        sample_size=args.sample_size, belief_decay=args.belief_decay,
+        sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
+        belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.actor_hidden_size,
         auction_type=args.auction_type, pinn_weight=args.pinn_weight,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
