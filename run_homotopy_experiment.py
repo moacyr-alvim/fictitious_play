@@ -18,6 +18,8 @@ def parse_args():
                          help="Safety cap on rounds per stage; each stage still stops "
                               "early once the usual max-diff/payoff criteria are met.")
     parser.add_argument("--sample-size", type=int, default=300_000)
+    parser.add_argument("--patience", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=20_000)
     parser.add_argument("--belief-decay", type=float, default=0.9)
     parser.add_argument("--max-diff-threshold", type=float, default=0.02)
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
@@ -45,7 +47,8 @@ def main():
     checkpoint_path = f"checkpoints/checkpoint{args.tag}.pt"
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.rounds_per_stage,
-        sample_size=args.sample_size, belief_decay=args.belief_decay,
+        sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
+        belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, payment_share=args.lambdas[0],
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
