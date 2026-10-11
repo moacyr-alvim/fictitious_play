@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from fictitious_play.plotting import save_all_plots
 from fictitious_play.train import FictitiousPlayTrainer
@@ -43,6 +44,9 @@ def parse_args():
                          help="Which agent's critic to plot.")
     parser.add_argument("--tag", type=str, default="",
                          help="Suffix appended to output figure/checkpoint filenames.")
+    parser.add_argument("--resume", action="store_true",
+                         help="If a checkpoint already exists at the target path, load it and "
+                              "run --n-rounds more rounds from there instead of starting over.")
     return parser.parse_args()
 
 
@@ -62,6 +66,9 @@ def main():
         seed=args.seed,
     )
     print(f"Device: {trainer.device}")
+    if args.resume and os.path.exists(checkpoint_path):
+        trainer.load_checkpoint()
+        print(f"Retomado de {checkpoint_path}: rodada {len(trainer.history)}")
     history = trainer.run()
 
     save_all_plots(trainer, history, args.n_agents, tag=args.tag, critic_agent=args.critic_agent,
