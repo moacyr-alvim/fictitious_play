@@ -1,6 +1,8 @@
 import torch
 
-from fictitious_play.train import FictitiousPlayTrainer
+from fictitious_play.benchmark import equilibrium_bid_lambda
+from fictitious_play.critic import SplineCritic
+from fictitious_play.train import FictitiousPlayTrainer, foc_residual
 
 
 def _residual_grad_norm(trainer: FictitiousPlayTrainer, agent_idx: int, lam: float,
@@ -59,3 +61,32 @@ def test_newton_predict_step_does_not_saturate_actor():
         for block in actor.blocks:
             raw = raw + block(v)
         assert raw.abs().max().item() < 50
+
+
+def test_foc_residual_vanishes_at_true_equilibrium():
+    """Correctness check for the PINN residual formula, independent of
+    training: if the critic is fit on bids actually drawn from the true
+    equilibrium strategy, the residual should be ~0 when evaluated at the
+    equilibrium bid function itself (for first-price, all-pay, and an
+    intermediate payment_share), since that's exactly the FOC the
+    equilibrium satisfies by construction."""
+    torch.manual_seed(0)
+    n_agents = 2
+    # all-pay's FOC depends purely on the critic's *derivative* (no level
+    # term to anchor it, see docs/findings_all_pay.md), so its residual is
+    # intrinsically noisier here even with a critic fit on true-equilibrium
+    # bids — a looser tolerance at lam=1.0 is the expected signature of
+    # that known sensitivity, not slack in the test.
+    tolerances = {0.0: 0.1, 0.4: 0.1, 1.0: 0.2}
+    for lam, tol in tolerances.items():
+        opponent_v = torch.rand(1_000_000)
+        opponent_bids = equilibrium_bid_lambda(opponent_v, n_agents, lam)
+        critic = SplineCritic(n_quantiles=3000)
+        critic.fit(opponent_bids.numpy())
+
+        v = torch.linspace(0.05, 0.95, 50).unsqueeze(1)
+        b = equilibrium_bid_lambda(v, n_agents, lam).clone().requires_grad_(True)
+        p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
+        residual = foc_residual(p_win, b, v, lam)
+
+        assert residual.abs().max().item() < tol

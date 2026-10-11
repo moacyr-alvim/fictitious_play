@@ -9,6 +9,19 @@ from .benchmark import AUCTION_TYPES, equilibrium_bid, equilibrium_bid_lambda, t
 from .critic import SplineCritic
 
 
+def foc_residual(p_win: torch.Tensor, b: torch.Tensor, v: torch.Tensor, lam: float) -> torch.Tensor:
+    """Pointwise residual of the first-order stationarity condition any
+    best response to a critic with win-probability p_win(b) = p_win must
+    satisfy at bid b (shape (batch, 1), must require grad) for valuation v,
+    under the payment rule with share lam (winner pays b, loser pays
+    lam*b): dPi/db = dP/db*(v-(1-lam)*b) - (1-lam)*P - lam, which is zero
+    exactly where b maximizes the expected payoff Pi(b;v) given p_win.
+    dP/db is obtained via autograd with create_graph=True so the result
+    stays differentiable w.r.t. whatever parameters b itself depends on."""
+    dp_db = torch.autograd.grad(p_win.sum(), b, create_graph=True)[0]
+    return dp_db * (v - (1 - lam) * b) - (1 - lam) * p_win - lam
+
+
 class FictitiousPlayTrainer:
     """Alternating best-response training for an N-agent first-price auction.
 
@@ -54,6 +67,7 @@ class FictitiousPlayTrainer:
                  critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  auction_type: str = "first_price", payment_share: float | None = None,
+                 pinn_weight: float = 0.0,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -69,6 +83,11 @@ class FictitiousPlayTrainer:
         # for homotopy continuation: step payment_share from 0 to 1 across
         # training stages, warm-starting each stage from the previous one.
         self.payment_share = payment_share
+        # Physics-informed regularizer: penalizes violation of the per-v
+        # first-order stationarity condition any best response must satisfy
+        # (see _best_response), weighted against the usual expected-payoff
+        # loss. 0 disables it (plain fictitious play).
+        self.pinn_weight = pinn_weight
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -319,10 +338,22 @@ class FictitiousPlayTrainer:
                 loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
             elif self.auction_type == "first_price":
                 # Payment only on winning: expected payoff = (v - b) * P(win | b).
+                lam = 0.0
                 loss = -((v - b) * p_win).mean()
             else:
                 # all_pay: payment b is due regardless of the outcome.
+                lam = 1.0
                 loss = -(v * p_win - b).mean()
+
+            if self.pinn_weight > 0:
+                # Physics-informed regularizer: penalize violation of the
+                # FOC any best response must satisfy pointwise (see
+                # foc_residual) — the same double-backward trick used for
+                # PINN residuals of a PDE/ODE, just one order lower (first
+                # derivative, not second) since b plays the role of the
+                # "input" here, not v.
+                residual = foc_residual(p_win, b, v, lam)
+                loss = loss + self.pinn_weight * (residual ** 2).mean()
 
             optimizer.zero_grad()
             loss.backward()
