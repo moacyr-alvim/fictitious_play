@@ -27,6 +27,12 @@ def parse_args():
                          help="Save a checkpoint every this many rounds (0 disables "
                               "periodic checkpointing; a final checkpoint is always saved).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use-newton-predictor", action="store_true",
+                         help="Before each payment_share change, take a damped "
+                              "block-diagonal Newton predictor step (see "
+                              "FictitiousPlayTrainer.newton_predict_step) to warm-start "
+                              "closer to the new stage's equilibrium.")
+    parser.add_argument("--newton-damping", type=float, default=1e-2)
     parser.add_argument("--critic-agent", type=int, default=0,
                          help="Which agent's critic to plot.")
     parser.add_argument("--tag", type=str, default="_homotopy",
@@ -52,6 +58,8 @@ def main():
     for stage_idx, lam in enumerate(args.lambdas):
         if stage_idx > 0:
             print(f"--- Avancando para payment_share={lam:.2f} (rodada {len(trainer.history)}) ---")
+            if args.use_newton_predictor:
+                trainer.newton_predict_step(lam, damping=args.newton_damping)
             trainer.set_payment_share(lam)
         print(f"Estagio {stage_idx}: payment_share={lam:.2f}")
         trainer.run()
