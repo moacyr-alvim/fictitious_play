@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from fictitious_play.plotting import save_all_plots
 from fictitious_play.train import FictitiousPlayTrainer
@@ -39,6 +40,9 @@ def parse_args():
                          help="Which agent's critic to plot.")
     parser.add_argument("--tag", type=str, default="_homotopy",
                          help="Suffix appended to output figure/checkpoint filenames.")
+    parser.add_argument("--resume", action="store_true",
+                         help="If a checkpoint already exists at the target path, load it "
+                              "and continue from its stage/round instead of starting over.")
     return parser.parse_args()
 
 
@@ -58,7 +62,17 @@ def main():
     )
     print(f"Device: {trainer.device}")
 
-    for stage_idx, lam in enumerate(args.lambdas):
+    start_stage_idx = 0
+    if args.resume and os.path.exists(checkpoint_path):
+        trainer.load_checkpoint()
+        start_stage_idx = args.lambdas.index(trainer.payment_share)
+        print(f"Retomado de {checkpoint_path}: rodada {len(trainer.history)}, "
+              f"estagio {start_stage_idx} (payment_share={trainer.payment_share:.2f})")
+        trainer.run()
+        start_stage_idx += 1
+
+    for stage_idx in range(start_stage_idx, len(args.lambdas)):
+        lam = args.lambdas[stage_idx]
         if stage_idx > 0:
             print(f"--- Avancando para payment_share={lam:.2f} (rodada {len(trainer.history)}) ---")
             if args.use_newton_predictor:
