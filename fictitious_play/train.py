@@ -145,6 +145,103 @@ class FictitiousPlayTrainer:
         self.payment_share = new_payment_share
         self.growth_rounds.append(len(self.history))
 
+    def newton_predict_step(self, new_payment_share: float, damping: float = 1e-2,
+                             sample_size: int | None = None) -> None:
+        """Block-diagonal Newton predictor for homotopy continuation: one
+        step of Newton's method on each agent's own first-order
+        stationarity condition F_i(theta_i) = grad_{theta_i} Loss_i = 0,
+        evaluated at the NEW payment_share but the OLD (already converged)
+        theta_i. To first order, F_i(theta_i_old, lambda_new) is exactly
+        the residual introduced by moving lambda while holding theta fixed
+        — this is the standard Davidenko-equation predictor step, with the
+        cross-agent Jacobian blocks (d F_i / d theta_j, j != i) dropped:
+        it ignores how agent i's optimality condition depends on agent j's
+        parameters, which is precisely the coupling that makes this a game
+        rather than N independent optimization problems (see
+        docs/findings_all_pay.md on why that coupling drives the cyclic
+        dynamics). Call this *before* set_payment_share, so the critic
+        used here still reflects the pre-step belief buffers.
+
+        The per-agent Hessian of a neural net's loss is typically
+        indefinite (confirmed empirically here: roughly half its
+        eigenvalues negative), so raw Newton's method is unreliable —
+        it can step toward a saddle point instead of a minimum. damping
+        is therefore not added as a fixed constant: it's the minimum
+        amount added beyond whatever is needed to make the damped
+        Hessian positive definite (Levenberg-Marquardt-style), computed
+        from the Hessian's own smallest eigenvalue each time.
+
+        Even damped, a single step built from one small random batch is
+        a noisy, locally-quadratic approximation of a landscape that
+        isn't very quadratic here: empirically the full step sometimes
+        cuts the residual gradient by an order of magnitude and
+        sometimes increases it, and more samples in the fitting batch
+        does not make this more reliable (the problem is the quadratic
+        model, not sampling noise in it). So the step is only ever taken
+        on faith as far as a backtracking line search with a held-out
+        validation batch (independent of the one used to fit the
+        Hessian): try the full step, then half, quarter, ... and keep
+        the first one that actually reduces the validation residual;
+        if none do, leave the agent's parameters untouched. This makes
+        the predictor provably non-harmful (residual never increases)
+        at the cost of sometimes doing nothing."""
+        n = sample_size or self.batch_size
+
+        def _residual(actor, critic, v, lam):
+            params = [p for p in actor.parameters() if p.requires_grad]
+            b = actor(v)
+            p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
+            loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
+            grad = torch.autograd.grad(loss, params)
+            return torch.cat([g.reshape(-1) for g in grad]).norm()
+
+        lam = new_payment_share
+        for agent_idx in range(self.n_agents):
+            actor = self.agents[agent_idx]
+            params = [p for p in actor.parameters() if p.requires_grad]
+            if not params:
+                continue
+
+            critic = self.critic_for(agent_idx)
+            v = torch.rand(n, 1, device=self.device)
+            b = actor(v)
+            p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
+            loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
+
+            grad = torch.autograd.grad(loss, params, create_graph=True)
+            flat_grad = torch.cat([g.reshape(-1) for g in grad])
+            d = flat_grad.numel()
+
+            hessian_rows = [
+                torch.cat([r.reshape(-1) for r in
+                           torch.autograd.grad(flat_grad[i], params, retain_graph=True)])
+                for i in range(d)
+            ]
+            hessian = torch.stack(hessian_rows)
+            hessian = (hessian + hessian.T) / 2
+            min_eig = torch.linalg.eigvalsh(hessian).min().item()
+            effective_damping = damping - min_eig if min_eig < 0 else damping
+            damped = hessian + effective_damping * torch.eye(d, device=self.device)
+            delta = torch.linalg.solve(damped, -flat_grad.detach())
+
+            v_val = torch.rand(n, 1, device=self.device)
+            baseline = _residual(actor, critic, v_val, lam)
+            original = [p.detach().clone() for p in params]
+
+            for scale in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                with torch.no_grad():
+                    offset = 0
+                    for p, orig in zip(params, original):
+                        numel = p.numel()
+                        p.copy_(orig + scale * delta[offset:offset + numel].view_as(p))
+                        offset += numel
+                if _residual(actor, critic, v_val, lam) < baseline:
+                    break
+            else:
+                with torch.no_grad():
+                    for p, orig in zip(params, original):
+                        p.copy_(orig)
+
     def _maybe_unfreeze(self, round_idx: int) -> None:
         if (self.freeze_mode == "temporary" and self._frozen_since_round is not None
                 and round_idx - self._frozen_since_round >= self.unfreeze_after_rounds):
