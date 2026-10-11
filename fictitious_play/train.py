@@ -146,7 +146,8 @@ class FictitiousPlayTrainer:
         self.growth_rounds.append(len(self.history))
 
     def newton_predict_step(self, new_payment_share: float, damping: float = 1e-2,
-                             sample_size: int | None = None) -> None:
+                             sample_size: int | None = None,
+                             trust_region: float = 0.2) -> None:
         """Block-diagonal Newton predictor for homotopy continuation: one
         step of Newton's method on each agent's own first-order
         stationarity condition F_i(theta_i) = grad_{theta_i} Loss_i = 0,
@@ -182,9 +183,24 @@ class FictitiousPlayTrainer:
         validation batch (independent of the one used to fit the
         Hessian): try the full step, then half, quarter, ... and keep
         the first one that actually reduces the validation residual;
-        if none do, leave the agent's parameters untouched. This makes
-        the predictor provably non-harmful (residual never increases)
-        at the cost of sometimes doing nothing."""
+        if none do, leave the agent's parameters untouched.
+
+        That line search alone is not enough, though: a near-singular
+        damped Hessian can still produce a delta whose norm dwarfs the
+        parameters it's added to, driving a hidden unit's pre-sigmoid
+        logit to +-100 or beyond. The sigmoid then saturates exactly to
+        0 or 1 in floating point, gradients vanish identically, and the
+        agent is permanently dead (stuck bidding 0 or v forever) —
+        while *looking* like a successful step, since a vanishing
+        gradient trivially passes the validation-residual check above
+        (empirically observed: it happened at the lambda=0.8->0.9
+        transition in one run, with the hidden block's output around
+        -140 and the agent bidding exactly 0 ever after). So before the
+        line search, delta is also capped to a trust-region radius
+        (a fixed fraction of the current parameter norm) — this bounds
+        the worst case regardless of how ill-conditioned the damped
+        Hessian solve turns out to be, independently of whatever the
+        line search's own residual check would have accepted."""
         n = sample_size or self.batch_size
 
         def _residual(actor, critic, v, lam):
@@ -224,9 +240,15 @@ class FictitiousPlayTrainer:
             damped = hessian + effective_damping * torch.eye(d, device=self.device)
             delta = torch.linalg.solve(damped, -flat_grad.detach())
 
+            original = [p.detach().clone() for p in params]
+            param_norm = torch.cat([p.reshape(-1) for p in original]).norm()
+            max_delta_norm = trust_region * param_norm.clamp(min=1e-6)
+            delta_norm = delta.norm()
+            if delta_norm > max_delta_norm:
+                delta = delta * (max_delta_norm / delta_norm)
+
             v_val = torch.rand(n, 1, device=self.device)
             baseline = _residual(actor, critic, v_val, lam)
-            original = [p.detach().clone() for p in params]
 
             for scale in (1.0, 0.5, 0.25, 0.125, 0.0625):
                 with torch.no_grad():
