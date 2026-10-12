@@ -2,7 +2,7 @@ import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
 from fictitious_play.critic import SplineCritic
-from fictitious_play.train import FictitiousPlayTrainer, foc_residual
+from fictitious_play.train import FictitiousPlayTrainer, foc_residual, foc_residual_opponent
 
 
 def _residual_grad_norm(trainer: FictitiousPlayTrainer, agent_idx: int, lam: float,
@@ -90,3 +90,21 @@ def test_foc_residual_vanishes_at_true_equilibrium():
         residual = foc_residual(p_win, b, v, lam)
 
         assert residual.abs().max().item() < tol
+
+
+def test_foc_residual_opponent_vanishes_at_true_equilibrium():
+    """Like test_foc_residual_vanishes_at_true_equilibrium, but using the
+    opponent-actor-based residual (no critic, no sampling): the opponent
+    is a plain function playing the exact equilibrium bid. With no
+    sampling noise in the loop, the residual should be much closer to
+    zero than the critic-based version (bisection precision only)."""
+    n_agents = 2
+    for lam in (0.0, 0.4, 1.0):
+        def opponent_actor(v, lam=lam):
+            return equilibrium_bid_lambda(v, n_agents, lam)
+
+        v = torch.linspace(0.05, 0.95, 50).unsqueeze(1)
+        b = equilibrium_bid_lambda(v, n_agents, lam).clone().requires_grad_(True)
+        residual = foc_residual_opponent(b, v, lam, opponent_actor)
+
+        assert residual.abs().max().item() < 1e-3

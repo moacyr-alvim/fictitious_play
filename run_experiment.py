@@ -31,11 +31,20 @@ def parse_args():
     parser.add_argument("--actor-hidden-size", type=int, default=32,
                          help="Hidden units in the actor's single hidden layer (0 = no hidden "
                               "layer, a constant shading factor).")
+    parser.add_argument("--payoff-weight", type=float, default=1.0,
+                         help="Weight of the usual critic-based expected-payoff loss. Set to 0 "
+                              "(together with --pinn-weight 0) to train purely on "
+                              "--pinn-opponent-weight's residual instead.")
     parser.add_argument("--pinn-weight", type=float, default=0.0,
                          help="Weight of the physics-informed regularizer that penalizes "
                               "violation of the per-v first-order stationarity condition any "
-                              "best response must satisfy (see fictitious_play.train.foc_residual). "
-                              "0 disables it (plain fictitious play).")
+                              "best response must satisfy, using the critic's P(win|b) and its "
+                              "derivative (see fictitious_play.train.foc_residual). 0 disables it.")
+    parser.add_argument("--pinn-opponent-weight", type=float, default=0.0,
+                         help="Like --pinn-weight, but P(win|b) and its derivative come from "
+                              "inverting the opponent's actor directly instead of the critic — "
+                              "exact, no sampling noise, but no belief-buffer memory either (see "
+                              "fictitious_play.train.foc_residual_opponent). Only n_agents=2.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -58,7 +67,8 @@ def main():
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
         belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.actor_hidden_size,
-        auction_type=args.auction_type, pinn_weight=args.pinn_weight,
+        auction_type=args.auction_type, payoff_weight=args.payoff_weight,
+        pinn_weight=args.pinn_weight, pinn_opponent_weight=args.pinn_opponent_weight,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

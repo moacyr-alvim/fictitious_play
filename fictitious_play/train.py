@@ -22,6 +22,53 @@ def foc_residual(p_win: torch.Tensor, b: torch.Tensor, v: torch.Tensor, lam: flo
     return dp_db * (v - (1 - lam) * b) - (1 - lam) * p_win - lam
 
 
+def _invert_monotonic(actor, target: torch.Tensor, iters: int = 30) -> torch.Tensor:
+    """Bisection search (batched, no grad) for v in [0, 1] with actor(v) ≈
+    target, assuming actor(v) is non-decreasing in v (true at/near a best
+    response, though not guaranteed mid-training — see
+    foc_residual_opponent)."""
+    lo = torch.zeros_like(target)
+    hi = torch.ones_like(target)
+    with torch.no_grad():
+        for _ in range(iters):
+            mid = (lo + hi) / 2
+            too_high = actor(mid) > target
+            hi = torch.where(too_high, mid, hi)
+            lo = torch.where(too_high, lo, mid)
+    return (lo + hi) / 2
+
+
+def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (phi(b), phi'(b)) where phi = opponent_actor^-1, treating
+    the opponent's parameters as fixed (this is called from the mover's
+    best-response step, where only the mover's own parameters should get
+    gradient). phi(b) is made differentiable w.r.t. b (and hence w.r.t.
+    whatever parameters b itself depends on) via a local linear correction
+    built from the implicit function theorem — the root itself is found
+    under no_grad (bisection isn't usefully differentiable), then phi's
+    known local slope 1/opponent_actor'(v*) carries the dependency on b."""
+    b_detached = b.detach()
+    v_star = _invert_monotonic(opponent_actor, b_detached).requires_grad_(True)
+    b_at_v_star = opponent_actor(v_star)
+    opponent_slope = torch.autograd.grad(b_at_v_star.sum(), v_star)[0]
+    phi_prime = (1.0 / opponent_slope.clamp(min=1e-6)).detach()
+    phi_val = v_star.detach() + phi_prime * (b - b_detached)
+    return phi_val, phi_prime
+
+
+def foc_residual_opponent(b: torch.Tensor, v: torch.Tensor, lam: float, opponent_actor) -> torch.Tensor:
+    """Like foc_residual, but P(win|b) and its derivative come from
+    inverting the opponent's own actor network directly (exact, given the
+    opponent's current strategy) instead of from a critic fit on sampled
+    belief-buffer bids — no density estimation, no sampling noise. Trades
+    that noise for a different approximation: it reflects the opponent's
+    literal current policy rather than a memory-smoothed belief, and
+    requires the opponent's bid function to be (at least locally) monotonic
+    for the inversion to mean anything."""
+    phi_val, phi_prime = opponent_inverse_and_slope(opponent_actor, b)
+    return phi_prime * (v - (1 - lam) * b) - (1 - lam) * phi_val - lam
+
+
 class FictitiousPlayTrainer:
     """Alternating best-response training for an N-agent first-price auction.
 
@@ -67,7 +114,8 @@ class FictitiousPlayTrainer:
                  critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  auction_type: str = "first_price", payment_share: float | None = None,
-                 pinn_weight: float = 0.0,
+                 payoff_weight: float = 1.0, pinn_weight: float = 0.0,
+                 pinn_opponent_weight: float = 0.0,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -83,11 +131,22 @@ class FictitiousPlayTrainer:
         # for homotopy continuation: step payment_share from 0 to 1 across
         # training stages, warm-starting each stage from the previous one.
         self.payment_share = payment_share
+        # Weight on the usual critic-based expected-payoff loss (1.0 =
+        # plain fictitious play). Set to 0 together with pinn_weight=0 to
+        # train purely on pinn_opponent_weight's residual instead.
+        self.payoff_weight = payoff_weight
         # Physics-informed regularizer: penalizes violation of the per-v
         # first-order stationarity condition any best response must satisfy
         # (see _best_response), weighted against the usual expected-payoff
-        # loss. 0 disables it (plain fictitious play).
+        # loss. 0 disables it (plain fictitious play). Uses the critic's
+        # (noisy, sampled) estimate of P(win|b) and its derivative.
         self.pinn_weight = pinn_weight
+        # Like pinn_weight, but P(win|b) and its derivative come from
+        # inverting the opponent's actor directly (exact, no critic) — see
+        # foc_residual_opponent. Only supported for n_agents == 2 so far.
+        self.pinn_opponent_weight = pinn_opponent_weight
+        if pinn_opponent_weight > 0 and n_agents != 2:
+            raise NotImplementedError("pinn_opponent_weight only supports n_agents == 2")
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -327,33 +386,44 @@ class FictitiousPlayTrainer:
         window = deque(maxlen=self.patience)
         steps_taken = 0
 
+        if self.payment_share is not None:
+            lam = self.payment_share
+        elif self.auction_type == "first_price":
+            lam = 0.0
+        else:
+            lam = 1.0
+
+        opponent_actor = None
+        if self.pinn_opponent_weight > 0:
+            opponent_idx = next(i for i in range(self.n_agents) if i != mover_idx)
+            opponent_actor = self.agents[opponent_idx]
+
         for step in range(self.max_steps):
             v = torch.rand(self.batch_size, 1, device=self.device)
             b = actor(v)
-            p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
-            if self.payment_share is not None:
-                # Generalized payment rule: winner pays b, losers pay
-                # payment_share * b. E[payoff] = P(win)*(v - (1-share)*b) - share*b.
-                lam = self.payment_share
-                loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
-            elif self.auction_type == "first_price":
-                # Payment only on winning: expected payoff = (v - b) * P(win | b).
-                lam = 0.0
-                loss = -((v - b) * p_win).mean()
-            else:
-                # all_pay: payment b is due regardless of the outcome.
-                lam = 1.0
-                loss = -(v * p_win - b).mean()
+            loss = torch.zeros((), device=self.device)
 
-            if self.pinn_weight > 0:
-                # Physics-informed regularizer: penalize violation of the
-                # FOC any best response must satisfy pointwise (see
-                # foc_residual) — the same double-backward trick used for
-                # PINN residuals of a PDE/ODE, just one order lower (first
-                # derivative, not second) since b plays the role of the
-                # "input" here, not v.
-                residual = foc_residual(p_win, b, v, lam)
-                loss = loss + self.pinn_weight * (residual ** 2).mean()
+            if self.payoff_weight > 0 or self.pinn_weight > 0:
+                p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
+                if self.payoff_weight > 0:
+                    # Generalized payment rule: winner pays b, losers pay
+                    # lam * b. E[payoff] = P(win)*(v - (1-lam)*b) - lam*b
+                    # (lam=0 recovers first-price, lam=1 recovers all-pay).
+                    payoff_loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
+                    loss = loss + self.payoff_weight * payoff_loss
+                if self.pinn_weight > 0:
+                    # Physics-informed regularizer: penalize violation of the
+                    # FOC any best response must satisfy pointwise (see
+                    # foc_residual) — the same double-backward trick used for
+                    # PINN residuals of a PDE/ODE, just one order lower (first
+                    # derivative, not second) since b plays the role of the
+                    # "input" here, not v.
+                    residual = foc_residual(p_win, b, v, lam)
+                    loss = loss + self.pinn_weight * (residual ** 2).mean()
+
+            if self.pinn_opponent_weight > 0:
+                residual_opp = foc_residual_opponent(b, v, lam, opponent_actor)
+                loss = loss + self.pinn_opponent_weight * (residual_opp ** 2).mean()
 
             optimizer.zero_grad()
             loss.backward()
