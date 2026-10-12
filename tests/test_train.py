@@ -2,7 +2,12 @@ import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
 from fictitious_play.critic import SplineCritic
-from fictitious_play.train import FictitiousPlayTrainer, foc_residual, foc_residual_opponent
+from fictitious_play.train import (
+    FictitiousPlayTrainer,
+    foc_residual,
+    foc_residual_opponent,
+    opponent_inverse_and_slope,
+)
 
 
 def _residual_grad_norm(trainer: FictitiousPlayTrainer, agent_idx: int, lam: float,
@@ -108,3 +113,21 @@ def test_foc_residual_opponent_vanishes_at_true_equilibrium():
         residual = foc_residual_opponent(b, v, lam, opponent_actor)
 
         assert residual.abs().max().item() < 1e-3
+
+
+def test_opponent_inverse_and_slope_bounded_past_opponents_range():
+    """Regression test: a homotopy run observed a mover bidding just past
+    the opponent's current achievable max getting back a huge phi' (the
+    bisection saturates at the boundary, where the opponent's slope can
+    be tiny), escalating further next step and saturating at b(v)=v. Bids
+    beyond the opponent's [actor(0), actor(1)] range must get phi'=0 (flat,
+    already-certain win), not a blown-up slope from extrapolating the
+    inversion past where the opponent actually reaches."""
+    def opponent_actor(v):
+        return 0.3 * v  # achievable range is [0, 0.3]
+
+    b = torch.tensor([[0.5]], requires_grad=True)  # far outside [0, 0.3]
+    phi_val, phi_prime = opponent_inverse_and_slope(opponent_actor, b)
+
+    assert phi_val.item() == 1.0
+    assert phi_prime.item() == 0.0

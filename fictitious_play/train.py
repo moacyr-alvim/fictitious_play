@@ -46,13 +46,36 @@ def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.T
     whatever parameters b itself depends on) via a local linear correction
     built from the implicit function theorem — the root itself is found
     under no_grad (bisection isn't usefully differentiable), then phi's
-    known local slope 1/opponent_actor'(v*) carries the dependency on b."""
+    known local slope 1/opponent_actor'(v*) carries the dependency on b.
+
+    b is clamped to the opponent's actually achievable range
+    [opponent_actor(0), opponent_actor(1)] before inverting: bidding
+    beyond that range wins for certain (phi=1) with no further marginal
+    effect (phi'=0), and extrapolating the bisection past the opponent's
+    real range instead (which a naive implementation would do, since
+    bisection just saturates its search interval) can return an near-flat
+    point of opponent_actor whose slope is tiny, making 1/slope blow up —
+    empirically this drove exactly this kind of runaway: a mover bidding
+    just past the opponent's current max got an exploding phi', escalated
+    further next step, and saturated at b(v)=v."""
     b_detached = b.detach()
-    v_star = _invert_monotonic(opponent_actor, b_detached).requires_grad_(True)
+    lo_b = opponent_actor(torch.zeros_like(b_detached))
+    hi_b = opponent_actor(torch.ones_like(b_detached))
+    in_range = (b_detached >= lo_b) & (b_detached <= hi_b)
+    b_clamped = torch.clamp(b_detached, min=lo_b, max=hi_b)
+
+    v_star = _invert_monotonic(opponent_actor, b_clamped).requires_grad_(True)
     b_at_v_star = opponent_actor(v_star)
     opponent_slope = torch.autograd.grad(b_at_v_star.sum(), v_star)[0]
-    phi_prime = (1.0 / opponent_slope.clamp(min=1e-6)).detach()
-    phi_val = v_star.detach() + phi_prime * (b - b_detached)
+    phi_prime_in_range = 1.0 / opponent_slope.clamp(min=1e-6)
+    phi_prime = torch.where(in_range, phi_prime_in_range, torch.zeros_like(phi_prime_in_range)).detach()
+
+    phi_val_in_range = v_star.detach()
+    phi_val_at_b_detached = torch.where(
+        b_detached > hi_b, torch.ones_like(b_detached),
+        torch.where(b_detached < lo_b, torch.zeros_like(b_detached), phi_val_in_range),
+    )
+    phi_val = phi_val_at_b_detached + phi_prime * (b - b_detached)
     return phi_val, phi_prime
 
 
