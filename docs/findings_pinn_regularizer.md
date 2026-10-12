@@ -1,10 +1,13 @@
 # Physics-informed (PINN-style) regularizers for best-response training
 
-**Status: two variants tried, both fail in pure form for all-pay; the
-critic-based one fails outright, the opponent-based one is provably
-gradient-dead at initialization. The opponent-based one works very well,
-standalone, for first-price. Next step (not yet tried): hybrid, combining
-the opponent-based residual with the existing critic-based payoff loss.**
+**Status: pure PINN (critic-based or opponent-based) does not work for
+all-pay, with or without homotopy continuation from first-price — the
+opponent-based variant's "no belief buffer" design turns out to be its
+core liability, not just a missing nicety: it's structurally equivalent
+to `belief_decay=0` fictitious play, which was already known to cycle. A
+first hybrid attempt (critic payoff loss + opponent-based residual) was
+expensive and showed no clear win; not yet understood why the critic's
+memory didn't visibly help there. Open problem.**
 
 ## Motivation
 
@@ -132,3 +135,108 @@ perturbations to matter.
   initialization that strands the opponent term alone, while the
   opponent term should steady the derivative-noise sensitivity the
   critic-only loss already struggles with.
+
+## First attempt at the hybrid: expensive, and no clear win
+
+Setup: N=2 all-pay, `belief_decay=0.98`, `payoff_weight=1.0`,
+`pinn_opponent_weight` swept from 0.01 to 1.0.
+
+Every weight tried, including the smallest (0.01), drove almost every
+round to the `max_steps` cap (5000) — the EMA-based patience/plateau
+stopping check essentially never fired once the opponent-based term was
+added, at any weight. Cost ballooned accordingly (~35s/round vs. a few
+seconds for the critic-only baseline). Quality after 10-15 rounds was
+already *worse* than the critic-only baseline at the same round count
+(`MaxDiff` 0.28-0.31 vs. the baseline's ~0.15-0.2). Adding the exact,
+noise-free term did not make training easier to stop or better in early
+rounds — a surprising result given the term's exactness, investigated
+below.
+
+## Homotopy with a *pure* opponent-based PINN (no critic, no belief buffer at all)
+
+Tried the continuation idea directly on the pure opponent-residual
+objective (`payoff_weight=0`, `pinn_opponent_weight=1.0`), starting the
+payment-share schedule at `lambda=0` (first-price) and stepping up,
+hoping to avoid the `lambda=1` degeneracy above by never actually
+training against an exactly-linear opponent once `lambda>0` (the
+equilibrium curves away from linear for any `lambda>0`, so `phi''(b)!=0`
+replaces `(1-lambda)` as the source of non-zero sensitivity — confirmed
+symbolically: `dR/db = phi''(b)*(v-(1-lambda)*b) - 2*(1-lambda)*phi'(b)`,
+nonzero as `lambda->1` as long as `phi''(b)!=0`, i.e. as long as the
+opponent isn't exactly linear).
+
+### A real bug found and fixed along the way
+
+The `lambda=0.1` stage initially produced a hard failure: one agent's
+bid function saturated to exactly `b(v)=v` (sigmoid pinned to 1). Cause:
+`opponent_inverse_and_slope`'s bisection search naively extrapolates past
+the opponent's actually-achievable bid range — if a mover's bid target
+exceeds `opponent_actor(1)` (the opponent's own current max), the search
+saturates at the domain boundary `v=1`, where the opponent's slope can be
+tiny, and `1/slope` then blows up. A mover that strays slightly above the
+opponent's range gets back a huge `phi'`, escalates further next step,
+and runs away. Fixed by clamping the inversion target to
+`[opponent_actor(0), opponent_actor(1)]` and returning the exact boundary
+values there (`phi=1, phi'=0` above the max — certain win, no further
+marginal effect — and symmetrically at the low end), matching the same
+clamp-before-inverting pattern `benchmark.theoretical_win_probability_lambda`
+already uses. See `test_opponent_inverse_and_slope_bounded_past_opponents_range`.
+
+### The deeper, structural finding: lambda=0 only looked easy by coincidence
+
+Even after that fix, `lambda=0.1` remained far harder than `lambda=0`
+— taking 110 of a 150-round cap and still landing at `MaxDiff` 0.13/0.43,
+asymmetric and unconverged. Round-by-round inspection (starting directly
+at `lambda=0.1`, no continuation) shows exactly the leap-frogging/war-of-
+attrition signature already documented for `belief_decay=0` in
+`findings_all_pay.md`:
+
+```
+round  5: MaxDiff=[0.13, 0.49]  payoff=[0.112, 0.037]
+round  7: MaxDiff=[0.30, 0.50]  payoff=[0.066, 0.004]   <- agent 1 ~wiped out
+round  9: MaxDiff=[0.07, 0.15]  payoff=[0.197, 0.192]   <- recovers
+round 23: MaxDiff=[0.10, 0.49]  payoff=[0.096, 0.040]   <- crashes again
+round 29: MaxDiff=[0.10, 0.49]  payoff=[0.101, 0.040]   <- and again
+```
+
+Root cause: `lambda=0` didn't actually demonstrate the method working —
+it demonstrated nothing moving at all. For N=2 first-price, the
+equilibrium is exactly `b*(v) = v/2`, and the `Actor`'s own
+initialization (`bias=0`, hidden blocks zero-initialized) computes
+*exactly* `b(v) = v*sigmoid(0) = v/2` — bit-for-bit the same function.
+Both agents start precisely on the fixed point, the residual is exactly
+zero everywhere for that function, so the gradient is exactly zero and
+training never leaves it. The tiny `MaxDiff` (~1e-6) at `lambda=0` is not
+convergence, it's a coincidence of this architecture plus this auction
+size never needing to move.
+
+The instant `lambda` increases even slightly, that accidental freeze
+breaks (the fixed point moves away from the initialization) and the
+*real* dynamics of this objective appear for the first time: each agent
+reacts to the opponent's literal, current actor, with no time-averaging
+— precisely the `belief_decay=0` regime. This is the same leap-frogging
+instability the belief buffer was built to fix in the very first phase
+of this project (for N>=3) and that reappeared for all-pay without
+memory. It was always latent in the pure opponent-based PINN
+formulation; `lambda=0` for N=2 just happened to hide it.
+
+This also reframes the first hybrid attempt's failure to converge
+quickly (`max_steps` cap hit at every weight): the opponent-based term's
+contribution to the loss is itself subject to this same memory-less
+leap-frogging pressure round to round, which plausibly explains why
+adding it — at any weight — disrupted the EMA/patience stopping check
+even when the critic-based term should have continued supplying a stable
+anchor. Not yet confirmed directly; see next steps.
+
+## Status / next steps
+
+- Pure opponent-based PINN, with or without homotopy, is not viable
+  without reintroducing some form of memory — it's structurally
+  equivalent to `belief_decay=0` fictitious play.
+- The hybrid (critic + belief buffer for memory, opponent-based residual
+  for exactness) is still the best-motivated path, but the first attempt
+  didn't show a clean win and was expensive. Worth revisiting with this
+  new understanding: the missing ingredient is damping/memory, not raw
+  precision, so the open question is why the critic's belief-buffer
+  memory didn't visibly stabilize the hybrid's round-to-round dynamics
+  the way it does for the critic-only baseline.
