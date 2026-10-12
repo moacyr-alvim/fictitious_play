@@ -26,6 +26,17 @@ def parse_args():
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=1000)
+    parser.add_argument("--payoff-weight", type=float, default=1.0,
+                         help="Weight of the usual critic-based expected-payoff loss. Set to 0 "
+                              "(together with --pinn-weight 0) for a pure PINN run driven only "
+                              "by --pinn-opponent-weight.")
+    parser.add_argument("--pinn-weight", type=float, default=0.0,
+                         help="Weight of the critic-derivative-based PINN regularizer (see "
+                              "fictitious_play.train.foc_residual). 0 disables it.")
+    parser.add_argument("--pinn-opponent-weight", type=float, default=0.0,
+                         help="Weight of the opponent-actor-based PINN residual (exact, no "
+                              "critic — see fictitious_play.train.foc_residual_opponent). "
+                              "Only n_agents=2.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables "
                               "periodic checkpointing; a final checkpoint is always saved).")
@@ -54,6 +65,8 @@ def main():
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
         belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, payment_share=args.lambdas[0],
+        payoff_weight=args.payoff_weight, pinn_weight=args.pinn_weight,
+        pinn_opponent_weight=args.pinn_opponent_weight,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
