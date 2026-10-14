@@ -138,7 +138,7 @@ class FictitiousPlayTrainer:
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  auction_type: str = "first_price", payment_share: float | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
-                 pinn_opponent_weight: float = 0.0,
+                 pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -170,6 +170,16 @@ class FictitiousPlayTrainer:
         self.pinn_opponent_weight = pinn_opponent_weight
         if pinn_opponent_weight > 0 and n_agents != 2:
             raise NotImplementedError("pinn_opponent_weight only supports n_agents == 2")
+        # Decay for the EMA "shadow" copy of each agent's actor that
+        # foc_residual_opponent inverts against (see _update_opponent_ema):
+        # inverting the opponent's literal current actor every round has no
+        # time-averaging at all, which is mathematically equivalent to
+        # belief_decay=0 fictitious play — already known to leap-frog/cycle
+        # (see docs/findings_pinn_regularizer.md). The EMA shadow restores
+        # the same kind of memory the belief buffer gives the critic, just
+        # applied to the opponent's weights directly instead of to a
+        # resampled pool of its past bids.
+        self.opponent_ema_decay = opponent_ema_decay
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -200,6 +210,11 @@ class FictitiousPlayTrainer:
 
         self.agents = [Actor(hidden_size=actor_hidden_size).to(self.device) for _ in range(n_agents)]
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=lr) for a in self.agents]
+        self.ema_agents = [Actor(hidden_size=actor_hidden_size).to(self.device) for _ in range(n_agents)]
+        for shadow, live in zip(self.ema_agents, self.agents):
+            shadow.load_state_dict(live.state_dict())
+            for p in shadow.parameters():
+                p.requires_grad_(False)
         self.belief_buffers = [self._fresh_bids(i) for i in range(n_agents)]
         self.history: list[dict] = []
         self.growth_rounds: list[int] = []
@@ -232,6 +247,14 @@ class FictitiousPlayTrainer:
         self.agents = [agent.grow(additional, freeze_previous=freeze).to(self.device)
                        for agent in self.agents]
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
+        # Resync the EMA shadows to match the new architecture, snapped to
+        # the live weights right after growth (the smoothing accumulates
+        # again from this point on).
+        self.ema_agents = [agent.grow(additional).to(self.device) for agent in self.ema_agents]
+        for shadow, live in zip(self.ema_agents, self.agents):
+            shadow.load_state_dict(live.state_dict())
+            for p in shadow.parameters():
+                p.requires_grad_(False)
         self.growth_rounds.append(len(self.history))
         self._frozen_since_round = len(self.history) if freeze else None
 
@@ -372,6 +395,19 @@ class FictitiousPlayTrainer:
                 agent.unfreeze_all()
             self._frozen_since_round = None
 
+    def _update_opponent_ema(self, agent_idx: int) -> None:
+        """Updates agent_idx's EMA shadow actor towards its just-updated
+        live weights (see opponent_ema_decay). Called once per round, after
+        the mover's best response is complete — the same granularity as
+        _update_belief, so the shadow plays the same time-averaging role
+        for foc_residual_opponent that the belief buffer plays for the
+        critic."""
+        decay = self.opponent_ema_decay
+        with torch.no_grad():
+            for shadow_p, live_p in zip(self.ema_agents[agent_idx].parameters(),
+                                         self.agents[agent_idx].parameters()):
+                shadow_p.mul_(decay).add_(live_p, alpha=1 - decay)
+
     def _update_belief(self, agent_idx: int) -> None:
         old = self.belief_buffers[agent_idx]
         fresh = self._fresh_bids(agent_idx)
@@ -419,7 +455,7 @@ class FictitiousPlayTrainer:
         opponent_actor = None
         if self.pinn_opponent_weight > 0:
             opponent_idx = next(i for i in range(self.n_agents) if i != mover_idx)
-            opponent_actor = self.agents[opponent_idx]
+            opponent_actor = self.ema_agents[opponent_idx]
 
         for step in range(self.max_steps):
             v = torch.rand(self.batch_size, 1, device=self.device)
@@ -549,6 +585,7 @@ class FictitiousPlayTrainer:
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
+            "ema_agents": [a.state_dict() for a in self.ema_agents],
             "optimizers": [o.state_dict() for o in self.optimizers],
             "belief_buffers": self.belief_buffers,
             "history": self.history,
@@ -573,6 +610,22 @@ class FictitiousPlayTrainer:
             self.agents.append(agent.to(self.device))
         for actor, state in zip(self.agents, checkpoint["agents"]):
             actor.load_state_dict(state)
+
+        self.ema_agents = []
+        for widths in checkpoint["agent_block_widths"]:
+            agent = Actor(hidden_size=0)
+            for width in widths:
+                agent.grow(width)
+            self.ema_agents.append(agent.to(self.device))
+        if "ema_agents" in checkpoint:
+            for shadow, state in zip(self.ema_agents, checkpoint["ema_agents"]):
+                shadow.load_state_dict(state)
+        else:
+            for shadow, live in zip(self.ema_agents, self.agents):
+                shadow.load_state_dict(live.state_dict())
+        for shadow in self.ema_agents:
+            for p in shadow.parameters():
+                p.requires_grad_(False)
 
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
         for optimizer, state in zip(self.optimizers, checkpoint["optimizers"]):
@@ -602,6 +655,7 @@ class FictitiousPlayTrainer:
 
             steps_taken = self._best_response(mover_idx, critic)
             self._update_belief(mover_idx)
+            self._update_opponent_ema(mover_idx)
 
             metrics = [self._benchmark_metrics(self.agents[i]) for i in range(self.n_agents)]
             mse = [m[0] for m in metrics]

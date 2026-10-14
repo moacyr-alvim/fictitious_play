@@ -37,6 +37,12 @@ def parse_args():
                          help="Weight of the opponent-actor-based PINN residual (exact, no "
                               "critic — see fictitious_play.train.foc_residual_opponent). "
                               "Only n_agents=2.")
+    parser.add_argument("--opponent-ema-decay", type=float, default=0.9,
+                         help="Decay of the EMA shadow actor that foc_residual_opponent "
+                              "inverts against instead of the opponent's literal live actor — "
+                              "gives the opponent-based PINN term the same kind of memory "
+                              "belief_decay gives the critic. Only matters if "
+                              "--pinn-opponent-weight > 0.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables "
                               "periodic checkpointing; a final checkpoint is always saved).")
@@ -67,6 +73,7 @@ def main():
         critic_n_quantiles=args.critic_n_quantiles, payment_share=args.lambdas[0],
         payoff_weight=args.payoff_weight, pinn_weight=args.pinn_weight,
         pinn_opponent_weight=args.pinn_opponent_weight,
+        opponent_ema_decay=args.opponent_ema_decay,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
