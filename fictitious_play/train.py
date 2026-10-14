@@ -139,6 +139,7 @@ class FictitiousPlayTrainer:
                  auction_type: str = "first_price", payment_share: float | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
                  pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
+                 opponent_ema_decay_schedule: tuple[float, float] | None = None,
                  max_diff_threshold: float | None = 0.02, payoff_rel_tol: float | None = 0.15,
                  payoff_stability_window: int = 10,
                  checkpoint_path: str | None = None, checkpoint_every: int = 20,
@@ -180,6 +181,15 @@ class FictitiousPlayTrainer:
         # applied to the opponent's weights directly instead of to a
         # resampled pool of its past bids.
         self.opponent_ema_decay = opponent_ema_decay
+        # Optional (decay_at_lambda=0, decay_at_lambda=1) pair: when set,
+        # overrides opponent_ema_decay with a linear schedule in the current
+        # payment_share instead of a fixed value. Motivated by the
+        # homotopy findings: the FOC's anchoring term weakens continuously
+        # as lambda->1 (docs/findings_pinn_regularizer.md), so the memory
+        # needed to keep the EMA shadow stable should grow the same way —
+        # weaker (cheaper, faster-reacting) memory where the anchor is
+        # already strong, stronger memory exactly where it's weakest.
+        self.opponent_ema_decay_schedule = opponent_ema_decay_schedule
         self.n_agents = n_agents
         self.n_rounds = n_rounds
         self.sample_size = sample_size
@@ -395,6 +405,13 @@ class FictitiousPlayTrainer:
                 agent.unfreeze_all()
             self._frozen_since_round = None
 
+    def _current_opponent_ema_decay(self) -> float:
+        if self.opponent_ema_decay_schedule is None:
+            return self.opponent_ema_decay
+        decay_at_0, decay_at_1 = self.opponent_ema_decay_schedule
+        lam = self.payment_share if self.payment_share is not None else 0.0
+        return decay_at_0 + (decay_at_1 - decay_at_0) * lam
+
     def _update_opponent_ema(self, agent_idx: int) -> None:
         """Updates agent_idx's EMA shadow actor towards its just-updated
         live weights (see opponent_ema_decay). Called once per round, after
@@ -402,7 +419,7 @@ class FictitiousPlayTrainer:
         _update_belief, so the shadow plays the same time-averaging role
         for foc_residual_opponent that the belief buffer plays for the
         critic."""
-        decay = self.opponent_ema_decay
+        decay = self._current_opponent_ema_decay()
         with torch.no_grad():
             for shadow_p, live_p in zip(self.ema_agents[agent_idx].parameters(),
                                          self.agents[agent_idx].parameters()):

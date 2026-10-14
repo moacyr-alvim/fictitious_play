@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
@@ -131,3 +132,17 @@ def test_opponent_inverse_and_slope_bounded_past_opponents_range():
 
     assert phi_val.item() == 1.0
     assert phi_prime.item() == 0.0
+
+
+def test_opponent_ema_decay_schedule_interpolates_with_payment_share():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, pinn_opponent_weight=1.0, payment_share=0.0,
+        opponent_ema_decay_schedule=(0.85, 0.995), seed=0,
+    )
+    assert trainer._current_opponent_ema_decay() == pytest.approx(0.85)
+
+    trainer.payment_share = 0.5
+    assert trainer._current_opponent_ema_decay() == pytest.approx(0.9225)
+
+    trainer.payment_share = 1.0
+    assert trainer._current_opponent_ema_decay() == pytest.approx(0.995)

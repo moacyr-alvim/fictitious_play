@@ -41,8 +41,15 @@ def parse_args():
                          help="Decay of the EMA shadow actor that foc_residual_opponent "
                               "inverts against instead of the opponent's literal live actor — "
                               "gives the opponent-based PINN term the same kind of memory "
-                              "belief_decay gives the critic. Only matters if "
-                              "--pinn-opponent-weight > 0.")
+                              "belief_decay gives the critic. Ignored if "
+                              "--opponent-ema-decay-start/--opponent-ema-decay-end are given. "
+                              "Only matters if --pinn-opponent-weight > 0.")
+    parser.add_argument("--opponent-ema-decay-start", type=float, default=None,
+                         help="If set together with --opponent-ema-decay-end, the EMA decay "
+                              "follows a linear schedule in the current payment_share instead "
+                              "of a fixed value: this is the decay at payment_share=0.")
+    parser.add_argument("--opponent-ema-decay-end", type=float, default=None,
+                         help="Decay at payment_share=1, paired with --opponent-ema-decay-start.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables "
                               "periodic checkpointing; a final checkpoint is always saved).")
@@ -66,6 +73,9 @@ def parse_args():
 def main():
     args = parse_args()
     checkpoint_path = f"checkpoints/checkpoint{args.tag}.pt"
+    opponent_ema_decay_schedule = None
+    if args.opponent_ema_decay_start is not None and args.opponent_ema_decay_end is not None:
+        opponent_ema_decay_schedule = (args.opponent_ema_decay_start, args.opponent_ema_decay_end)
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.rounds_per_stage,
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
@@ -74,6 +84,7 @@ def main():
         payoff_weight=args.payoff_weight, pinn_weight=args.pinn_weight,
         pinn_opponent_weight=args.pinn_opponent_weight,
         opponent_ema_decay=args.opponent_ema_decay,
+        opponent_ema_decay_schedule=opponent_ema_decay_schedule,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
