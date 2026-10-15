@@ -1,13 +1,15 @@
 # Physics-informed (PINN-style) regularizers for best-response training
 
-**Status: pure PINN (critic-based or opponent-based) does not work for
-all-pay, with or without homotopy continuation from first-price — the
-opponent-based variant's "no belief buffer" design turns out to be its
-core liability, not just a missing nicety: it's structurally equivalent
-to `belief_decay=0` fictitious play, which was already known to cycle. A
-first hybrid attempt (critic payoff loss + opponent-based residual) was
-expensive and showed no clear win; not yet understood why the critic's
-memory didn't visibly help there. Open problem.**
+**Status: solved, for practical purposes. Giving the opponent-based PINN
+residual its own memory (an EMA shadow of the opponent's weights,
+`opponent_ema_decay`) fixes the leap-frogging that made it useless on
+its own, and — combined with the critic's payoff loss and belief buffer
+— lets the hybrid stabilize all-pay *directly*, no homotopy continuation
+needed, beating the critic-only baseline at matched round counts. See
+"The hybrid, revisited: EMA fixes it" below; the underlying data is in
+`checkpoints/checkpoint_allpay_hybrid.pt` (hybrid) vs.
+`checkpoints/checkpoint_allpay_pinn0_baseline.pt` (critic-only, same
+settings).**
 
 ## Motivation
 
@@ -228,15 +230,123 @@ adding it — at any weight — disrupted the EMA/patience stopping check
 even when the critic-based term should have continued supplying a stable
 anchor. Not yet confirmed directly; see next steps.
 
+## The fix: an EMA shadow gives the opponent-based residual its own memory
+
+`_update_opponent_ema` keeps, per agent, an exponential-moving-average
+copy of its own weights (`opponent_ema_decay`), updated once per round
+right after that agent's own best response — same granularity as the
+critic's belief buffer. `foc_residual_opponent` inverts against the
+*shadow*, not the live actor. This is a direct implementation of the
+"fictitious play against a time-averaged opponent, not its latest
+snapshot" idea (independently suggested as a fix for this exact failure
+mode when asked to vet the diagnosis against a general-purpose list of
+RL-stabilization techniques) — restoring, for the exact/opponent-based
+residual, the same memory the belief buffer already gives the critic.
+
+Repeating the direct `lambda=0.1` test (no homotopy, 40 rounds) with
+`opponent_ema_decay=0.9`: `MaxDiff` now falls smoothly and
+monotonically for both agents (0.029→0.015), payoffs converge cleanly to
+the theoretical 0.1667 — no leap-frogging at all. Confirms the diagnosis
+directly: it was a memory problem, not an exactness problem.
+
+### Decay needs to track how close lambda is to 1, not be fixed
+
+A fixed `opponent_ema_decay=0.9` stabilizes `lambda=0.1` but still
+eventually breaks down at higher `lambda` — not always at the same
+stage, but always eventually, and sooner the larger `lambda` is (stable
+150 rounds at `lambda=0.1`; drifts into saturation by round ~80 at
+`lambda=0.3`; chaotic almost immediately at `lambda=0.5`; saturates
+within 60 rounds at `lambda=0.7`). The breakdown is a slow *monotonic*
+drift (one agent's `MaxDiff` climbing steadily to exactly 0.5 and
+sticking, not oscillating) — the signature of a one-directional bias
+that EMA, which only cancels sign-alternating noise, delays rather than
+arrests. This matches the theory directly: the FOC's restoring-force
+coefficient is `~ -2*(1-lambda)*phi'(b)` (linear-opponent case; see
+above) — it weakens continuously as `lambda->1`, so a fixed amount of
+memory that's enough to stabilize a strong restoring force (small
+`lambda`) is not enough once that force is weak (`lambda` near 1).
+
+Tried a fixed `opponent_ema_decay=0.98` across the full homotopy
+schedule (`lambda`: 0 to 1, step 0.1): clean and fast through
+`lambda<=0.7` (~11 rounds/stage), then one agent drifts to saturation
+starting at `lambda=0.8`, stuck there through `lambda=1.0` — the
+breakdown point moved from `~0.3` (decay 0.9) to `~0.8` (decay 0.98),
+consistent with "more memory delays but doesn't eliminate the problem,
+because the underlying restoring force still hits zero at lambda=1".
+
+Made `opponent_ema_decay` a linear schedule in the current `lambda`
+instead (`opponent_ema_decay_schedule=(decay_at_0, decay_at_1)`,
+interpolated via `payment_share`). `(0.85, 0.995)` performed *worse*
+than the fixed 0.98 — at `lambda=0.8` the schedule gives `0.85 +
+0.145*0.8 = 0.966`, weaker than the 0.98 already known to struggle
+there; it only exceeds 0.98 very close to `lambda=1`, too late. Raising
+the starting point fixed this: `(0.95, 0.995)` reached `lambda=1`
+without any saturation at all (every stage converged in its normal
+~11-round budget, no stage ever hit the round cap), ending at `MaxDiff`
+0.35/0.35, symmetric payoffs ~0.11/0.10 (vs. 0.1667 theoretical) —
+not a clean equilibrium, but no collapse either, a first for any
+pure-PINN attempt at `lambda=1`. `(0.97, 0.995)` pushed this a bit
+further (`MaxDiff` 0.31/0.27), with diminishing returns past that point.
+
+The fact that the schedule's *shape* mattered as much as its endpoints —
+and that the needed correction (start higher, not just end higher) runs
+the opposite direction of a naive "keep per-round loop gain constant"
+argument — suggests a fully principled schedule would come from
+linearizing the two-agent EMA-feedback recursion and solving for the
+decay that keeps it stable at each `lambda`, rather than the two
+empirical endpoints used here. Not attempted; flagged as a sharper
+version of the "let the problem's own structure suggest the
+hyperparameters" idea discussed below.
+
+## The hybrid, revisited: EMA fixes it
+
+The first hybrid attempt (critic payoff loss + opponent-based residual,
+before the EMA shadow existed) hit `max_steps` at nearly every round,
+at every weight tried, and showed no quality advantage over the
+critic-only baseline. Re-run with the EMA shadow in place
+(`opponent_ema_decay=0.97`) and the pathology is gone: step counts vary
+normally again (tens to a few thousand, not pegged at 5000).
+
+Direct 420-round comparison, both starting cold at `lambda=1`
+(all-pay) — **no homotopy continuation in either run**, same
+`belief_decay=0.98`, same seed — `payoff_weight=1.0,
+pinn_opponent_weight=0.1, opponent_ema_decay=0.97` vs. the critic-only
+baseline (`pinn_opponent_weight=0.0`):
+
+| | hybrid | critic-only baseline |
+|---|---:|---:|
+| `MaxDiff` at round 419/420 | 0.131 / 0.128 | 0.160 / 0.175 |
+| trend, last 20 rounds | falling smoothly and monotonically | falling, then turning back up (agent 1: 0.160->0.175) |
+
+The hybrid is ahead on both agents at the same round count, and —
+notably — doesn't show the slow reversal the critic-only run is just
+starting to show (consistent with the ~150-250-round quasi-cycle
+`findings_all_pay.md` documents for the critic-only approach). This is
+the first configuration in this whole investigation where the
+opponent-based PINN term is a clear, measurable net positive rather
+than neutral-to-harmful.
+
 ## Status / next steps
 
-- Pure opponent-based PINN, with or without homotopy, is not viable
-  without reintroducing some form of memory — it's structurally
-  equivalent to `belief_decay=0` fictitious play.
-- The hybrid (critic + belief buffer for memory, opponent-based residual
-  for exactness) is still the best-motivated path, but the first attempt
-  didn't show a clean win and was expensive. Worth revisiting with this
-  new understanding: the missing ingredient is damping/memory, not raw
-  precision, so the open question is why the critic's belief-buffer
-  memory didn't visibly stabilize the hybrid's round-to-round dynamics
-  the way it does for the critic-only baseline.
+- The hybrid (`payoff_weight=1.0` critic + belief buffer, plus
+  `pinn_opponent_weight>0` with an EMA-shadowed opponent) is the
+  best-performing configuration found for all-pay to date, and it
+  doesn't need homotopy continuation to get there — though combining it
+  with homotopy (now that the opponent term has its own memory) hasn't
+  been tried and might do even better.
+- Not yet checked: does the hybrid's advantage keep compounding past
+  round 420, or does it eventually hit its own version of the
+  quasi-cycle (just delayed further)?
+- Not yet tuned: `pinn_opponent_weight` (only 0.1 tried in the winning
+  hybrid run) and whether a decay *schedule* (vs. the fixed 0.97 used)
+  helps the hybrid the way it helped the pure-PINN homotopy case.
+- Broader open idea (raised explicitly, worth keeping in view): does the
+  auction problem's own structure — or diagnostics computed from a run
+  at some reference configuration — point directly at good
+  hyperparameters for these tools, rather than needing a hand-tuned
+  sweep each time? The restoring-force formula `~(1-lambda)` is one
+  concrete instance already in hand (it's *why* the decay schedule
+  needs to ramp up toward `lambda=1`, not just an empirical fit); the
+  Jacobian-eigenvalue idea noted earlier (complex eigenvalues flagging
+  rotational/cyclic dynamics) is another candidate that hasn't been
+  computed yet for this problem specifically.
