@@ -79,17 +79,40 @@ def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.T
     return phi_val, phi_prime
 
 
-def foc_residual_opponent(b: torch.Tensor, v: torch.Tensor, lam: float, opponent_actor) -> torch.Tensor:
+def foc_residual_opponent(b: torch.Tensor, v: torch.Tensor, lam: float, opponent_actors: list) -> torch.Tensor:
     """Like foc_residual, but P(win|b) and its derivative come from
-    inverting the opponent's own actor network directly (exact, given the
-    opponent's current strategy) instead of from a critic fit on sampled
+    inverting each opponent's own actor network directly (exact, given
+    their current strategies) instead of from a critic fit on sampled
     belief-buffer bids — no density estimation, no sampling noise. Trades
-    that noise for a different approximation: it reflects the opponent's
-    literal current policy rather than a memory-smoothed belief, and
-    requires the opponent's bid function to be (at least locally) monotonic
-    for the inversion to mean anything."""
-    phi_val, phi_prime = opponent_inverse_and_slope(opponent_actor, b)
-    return phi_prime * (v - (1 - lam) * b) - (1 - lam) * phi_val - lam
+    that noise for a different approximation: it reflects the opponents'
+    literal current policies rather than a memory-smoothed belief, and
+    requires each opponent's bid function to be (at least locally)
+    monotonic for the inversion to mean anything.
+
+    With N-1 independent opponents, winning means beating all of them at
+    once: P(win|b) = prod_j phi_j(b). Its derivative follows the product
+    rule, dP/db = sum_k [phi_k'(b) * prod_{j!=k} phi_j(b)] — for a single
+    opponent (N=2) this reduces to exactly the old phi_prime term."""
+    phi_vals = []
+    phi_primes = []
+    for opponent_actor in opponent_actors:
+        phi_val, phi_prime = opponent_inverse_and_slope(opponent_actor, b)
+        phi_vals.append(phi_val)
+        phi_primes.append(phi_prime)
+
+    p_win = phi_vals[0]
+    for phi_val in phi_vals[1:]:
+        p_win = p_win * phi_val
+
+    dp_db = torch.zeros_like(b)
+    for k in range(len(opponent_actors)):
+        term = phi_primes[k]
+        for j in range(len(opponent_actors)):
+            if j != k:
+                term = term * phi_vals[j]
+        dp_db = dp_db + term
+
+    return dp_db * (v - (1 - lam) * b) - (1 - lam) * p_win - lam
 
 
 class FictitiousPlayTrainer:
@@ -166,11 +189,9 @@ class FictitiousPlayTrainer:
         # (noisy, sampled) estimate of P(win|b) and its derivative.
         self.pinn_weight = pinn_weight
         # Like pinn_weight, but P(win|b) and its derivative come from
-        # inverting the opponent's actor directly (exact, no critic) — see
-        # foc_residual_opponent. Only supported for n_agents == 2 so far.
+        # inverting every opponent's actor directly (exact, no critic) —
+        # see foc_residual_opponent.
         self.pinn_opponent_weight = pinn_opponent_weight
-        if pinn_opponent_weight > 0 and n_agents != 2:
-            raise NotImplementedError("pinn_opponent_weight only supports n_agents == 2")
         # Decay for the EMA "shadow" copy of each agent's actor that
         # foc_residual_opponent inverts against (see _update_opponent_ema):
         # inverting the opponent's literal current actor every round has no
@@ -469,10 +490,9 @@ class FictitiousPlayTrainer:
         else:
             lam = 1.0
 
-        opponent_actor = None
+        opponent_actors = None
         if self.pinn_opponent_weight > 0:
-            opponent_idx = next(i for i in range(self.n_agents) if i != mover_idx)
-            opponent_actor = self.ema_agents[opponent_idx]
+            opponent_actors = [self.ema_agents[i] for i in range(self.n_agents) if i != mover_idx]
 
         for step in range(self.max_steps):
             v = torch.rand(self.batch_size, 1, device=self.device)
@@ -498,7 +518,7 @@ class FictitiousPlayTrainer:
                     loss = loss + self.pinn_weight * (residual ** 2).mean()
 
             if self.pinn_opponent_weight > 0:
-                residual_opp = foc_residual_opponent(b, v, lam, opponent_actor)
+                residual_opp = foc_residual_opponent(b, v, lam, opponent_actors)
                 loss = loss + self.pinn_opponent_weight * (residual_opp ** 2).mean()
 
             optimizer.zero_grad()

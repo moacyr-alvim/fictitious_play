@@ -111,9 +111,26 @@ def test_foc_residual_opponent_vanishes_at_true_equilibrium():
 
         v = torch.linspace(0.05, 0.95, 50).unsqueeze(1)
         b = equilibrium_bid_lambda(v, n_agents, lam).clone().requires_grad_(True)
-        residual = foc_residual_opponent(b, v, lam, opponent_actor)
+        residual = foc_residual_opponent(b, v, lam, [opponent_actor])
 
         assert residual.abs().max().item() < 1e-3
+
+
+def test_foc_residual_opponent_vanishes_at_true_equilibrium_n_agents():
+    """Same correctness check with N=5 (4 opponents), all playing the
+    same symmetric equilibrium strategy — exercises the product-rule
+    generalization of P(win|b) and its derivative over multiple
+    opponents, not just the single-opponent (N=2) case."""
+    n_agents = 5
+    for lam in (0.0, 0.5, 1.0):
+        def opponent_actor(v, lam=lam):
+            return equilibrium_bid_lambda(v, n_agents, lam)
+
+        v = torch.linspace(0.05, 0.95, 50).unsqueeze(1)
+        b = equilibrium_bid_lambda(v, n_agents, lam).clone().requires_grad_(True)
+        residual = foc_residual_opponent(b, v, lam, [opponent_actor] * (n_agents - 1))
+
+        assert residual.abs().max().item() < 1e-2
 
 
 def test_opponent_inverse_and_slope_bounded_past_opponents_range():
