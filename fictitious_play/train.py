@@ -300,6 +300,44 @@ class FictitiousPlayTrainer:
         self.payment_share = new_payment_share
         self.growth_rounds.append(len(self.history))
 
+    def add_agents(self, additional_agents: int, copy_from: int = 0) -> None:
+        """Grows the game itself by adding more agents, each warm-started
+        as a copy of copy_from's current actor — reasonable since a
+        symmetric equilibrium has every agent playing the same function
+        anyway. The actor architecture doesn't depend on n_agents at all
+        (it's just v -> b(v)), so unlike grow_agents this needs no network
+        surgery on the existing agents — only the belief buffers, the
+        critic's win-probability estimate and the closed-form equilibrium
+        target change with more opponents in the room. Marked as a stage
+        boundary the same way grow_agents/set_payment_share are, so this
+        can be used as a continuation axis in N alongside the one in
+        payment_share: solve N agents fully (e.g. the whole lambda=0->1
+        ramp), add one, and repeat."""
+        template_state = self.agents[copy_from].state_dict()
+        template_widths = [block.width for block in self.agents[copy_from].blocks]
+
+        def _cloned_actor() -> Actor:
+            actor = Actor(hidden_size=0)
+            for width in template_widths:
+                actor.grow(width)
+            actor = actor.to(self.device)
+            actor.load_state_dict(template_state)
+            return actor
+
+        for _ in range(additional_agents):
+            new_agent = _cloned_actor()
+            self.agents.append(new_agent)
+            self.optimizers.append(torch.optim.Adam(new_agent.parameters(), lr=self.lr))
+
+            shadow = _cloned_actor()
+            for p in shadow.parameters():
+                p.requires_grad_(False)
+            self.ema_agents.append(shadow)
+
+        self.n_agents += additional_agents
+        self.belief_buffers = [self._fresh_bids(i) for i in range(self.n_agents)]
+        self.growth_rounds.append(len(self.history))
+
     def newton_predict_step(self, new_payment_share: float, damping: float = 1e-2,
                              sample_size: int | None = None,
                              trust_region: float = 0.2) -> None:

@@ -163,3 +163,26 @@ def test_opponent_ema_decay_schedule_interpolates_with_payment_share():
 
     trainer.payment_share = 1.0
     assert trainer._current_opponent_ema_decay() == pytest.approx(0.995)
+
+
+def test_add_agents_clones_weights_and_extends_bookkeeping():
+    trainer = FictitiousPlayTrainer(n_agents=2, sample_size=100, seed=0)
+    v = torch.linspace(0, 1, 11).unsqueeze(1)
+    with torch.no_grad():
+        original_bids = trainer.agents[0](v)
+
+    trainer.add_agents(2, copy_from=0)
+
+    assert trainer.n_agents == 4
+    assert len(trainer.agents) == 4
+    assert len(trainer.optimizers) == 4
+    assert len(trainer.ema_agents) == 4
+    assert len(trainer.belief_buffers) == 4
+
+    for idx in (2, 3):
+        with torch.no_grad():
+            cloned_bids = trainer.agents[idx](v)
+        assert torch.allclose(cloned_bids, original_bids)
+        assert not any(p.requires_grad for p in trainer.ema_agents[idx].parameters())
+
+    assert trainer.growth_rounds == [0]
