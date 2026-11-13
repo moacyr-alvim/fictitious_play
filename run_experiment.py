@@ -27,7 +27,15 @@ def parse_args():
                               "--payoff-window rounds. Use a negative value to disable.")
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=400,
-                         help="Number of quantile points the spline critic is fit on.")
+                         help="Number of quantile points the spline critic is fit on. "
+                              "Ignored if --critic-type beta.")
+    parser.add_argument("--critic-type", type=str, default="spline",
+                         choices=["spline", "beta"],
+                         help="spline: monotone cubic Hermite spline over empirical quantiles "
+                              "(fictitious_play.critic.SplineCritic). beta: fit a scaled "
+                              "Beta(alpha, 1) distribution (2 parameters) instead — exact at "
+                              "the first-price and all-pay equilibria, lower variance, exact "
+                              "analytic derivative (see fictitious_play.critic.BetaCritic).")
     parser.add_argument("--actor-hidden-size", type=int, default=32,
                          help="Hidden units in the actor's single hidden layer (0 = no hidden "
                               "layer, a constant shading factor).")
@@ -70,7 +78,8 @@ def main():
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
         belief_decay=args.belief_decay,
-        critic_n_quantiles=args.critic_n_quantiles, actor_hidden_size=args.actor_hidden_size,
+        critic_n_quantiles=args.critic_n_quantiles, critic_type=args.critic_type,
+        actor_hidden_size=args.actor_hidden_size,
         auction_type=args.auction_type, payoff_weight=args.payoff_weight,
         pinn_weight=args.pinn_weight, pinn_opponent_weight=args.pinn_opponent_weight,
         opponent_ema_decay=args.opponent_ema_decay,

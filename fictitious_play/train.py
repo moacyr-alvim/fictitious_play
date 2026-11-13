@@ -6,7 +6,9 @@ import torch
 
 from .actor import Actor
 from .benchmark import AUCTION_TYPES, equilibrium_bid, equilibrium_bid_lambda, theoretical_expected_payoff
-from .critic import SplineCritic
+from .critic import BetaCritic, SplineCritic
+
+CRITIC_TYPES = ("spline", "beta")
 
 
 def foc_residual(p_win: torch.Tensor, b: torch.Tensor, v: torch.Tensor, lam: float) -> torch.Tensor:
@@ -157,7 +159,8 @@ class FictitiousPlayTrainer:
                  patience: int = 200, tol: float = 1e-6, lr: float = 1e-3,
                  ema_decay: float = 0.98, eval_grid_size: int = 200,
                  belief_decay: float = 0.9, payoff_eval_samples: int = 100_000,
-                 critic_n_quantiles: int = 400, actor_hidden_size: int = 32,
+                 critic_n_quantiles: int = 400, critic_type: str = "spline",
+                 actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  auction_type: str = "first_price", payment_share: float | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
@@ -171,6 +174,9 @@ class FictitiousPlayTrainer:
             raise ValueError('freeze_mode must be "none", "permanent", or "temporary"')
         if auction_type not in AUCTION_TYPES:
             raise ValueError(f"auction_type must be one of {AUCTION_TYPES}")
+        if critic_type not in CRITIC_TYPES:
+            raise ValueError(f"critic_type must be one of {CRITIC_TYPES}")
+        self.critic_type = critic_type
         self.auction_type = auction_type
         # payment_share (lambda), when set, overrides auction_type: it drives
         # the generalized payment rule that interpolates between first-price
@@ -503,17 +509,22 @@ class FictitiousPlayTrainer:
                  for idx in opponent_indices]
         return np.maximum.reduce(draws)
 
-    def critic_for(self, mover_idx: int) -> SplineCritic:
+    def _new_critic(self) -> SplineCritic | BetaCritic:
+        if self.critic_type == "beta":
+            return BetaCritic(device=self.device)
+        return SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
+
+    def critic_for(self, mover_idx: int) -> SplineCritic | BetaCritic:
         """Fits (without training) the critic mover_idx currently faces,
         i.e. the smoothed CDF of the max bid drawn from the other agents'
         belief buffers."""
         opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
         opponent_bids = self._sample_max_belief_bids(opponent_indices)
-        critic = SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
+        critic = self._new_critic()
         critic.fit(opponent_bids)
         return critic
 
-    def _best_response(self, mover_idx: int, critic: SplineCritic) -> int:
+    def _best_response(self, mover_idx: int, critic: SplineCritic | BetaCritic) -> int:
         actor = self.agents[mover_idx]
         optimizer = self.optimizers[mover_idx]
 
@@ -725,7 +736,7 @@ class FictitiousPlayTrainer:
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 
             opponent_bids = self._sample_max_belief_bids(opponent_indices)
-            critic = SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
+            critic = self._new_critic()
             critic.fit(opponent_bids)
 
             steps_taken = self._best_response(mover_idx, critic)

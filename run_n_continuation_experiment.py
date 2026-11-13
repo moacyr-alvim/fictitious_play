@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=1000)
+    parser.add_argument("--critic-type", type=str, default="spline", choices=["spline", "beta"])
     parser.add_argument("--checkpoint-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--critic-agent", type=int, default=0)
@@ -46,7 +47,7 @@ def main():
         n_agents=start_n, n_rounds=args.rounds_per_lambda_stage,
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
         belief_decay=args.belief_decay, critic_n_quantiles=args.critic_n_quantiles,
-        payment_share=args.lambdas[0],
+        critic_type=args.critic_type, payment_share=args.lambdas[0],
         # Pure critic + belief buffer ("continuação analítica") — no PINN terms.
         payoff_weight=1.0, pinn_weight=0.0, pinn_opponent_weight=0.0,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,

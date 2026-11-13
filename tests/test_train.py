@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
-from fictitious_play.critic import SplineCritic
+from fictitious_play.critic import BetaCritic, SplineCritic
 from fictitious_play.train import (
     FictitiousPlayTrainer,
     foc_residual,
@@ -186,3 +186,20 @@ def test_add_agents_clones_weights_and_extends_bookkeeping():
         assert not any(p.requires_grad for p in trainer.ema_agents[idx].parameters())
 
     assert trainer.growth_rounds == [0]
+
+
+def test_critic_type_beta_wires_beta_critic_and_trains():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        critic_type="beta", max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    critic = trainer.critic_for(0)
+    assert isinstance(critic, BetaCritic)
+
+    history = trainer.run(verbose=False)
+    assert len(history) == 3
+
+
+def test_critic_type_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, critic_type="not_a_real_type")
