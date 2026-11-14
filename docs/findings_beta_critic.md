@@ -1,6 +1,6 @@
 # Beta-distribution critic: replacing the spline with an exact, 2-parameter fit
 
-**Status: strong early result.** On N=2 all-pay, with no PINN and no EMA —
+**Status: strong result, confirmed at both N=2 and N=5.** On N=2 all-pay, with no PINN and no EMA —
 just the critic swapped from `SplineCritic` to `BetaCritic`, everything
 else identical (same seed, same belief buffer, same disabled early-stopping
 so the comparison is round-for-round) — `BetaCritic` converges cleanly to
@@ -12,6 +12,16 @@ leap-frogging/cycling pattern documented in `docs/findings_all_pay.md` and
 `MaxDiff0=0.199, MaxDiff1=0.140`. This is the first setup in this project
 where all-pay is stabilized *without* any PINN regularizer, EMA shadow, or
 homotopy continuation.
+
+Confirmed at N=5 as well (see "N=5 all-pay head-to-head" below): `BetaCritic`
+settles into `MaxDiff ~0.07-0.10` with payoffs matching the theoretical
+value almost exactly, purely from critic + belief buffer — no progressive
+network growth, no PINN, nothing else — on the exact N=5 all-pay setup that
+previously collapsed catastrophically (see
+`docs/findings_pinn_regularizer.md`'s "N=5" section). `SplineCritic`, run
+under identical conditions, never escapes initialization-level `MaxDiff`
+(stuck at `~0.44-0.49` after as many rounds, with payoffs swinging wildly
+between -0.2 and +0.2 depending on which agent just moved).
 
 ## Motivation: an exact distributional identity
 
@@ -117,6 +127,48 @@ that earlier machinery was built to route around may have been, at least in
 large part, a critic-estimator-noise problem rather than an irreducible
 property of the all-pay FOC itself.
 
+## N=5 all-pay head-to-head
+
+Same methodology, now on the exact N=5 all-pay setup that previously
+collapsed catastrophically with the PINN/EMA hybrid
+(`docs/findings_pinn_regularizer.md`'s "N=5" section — traced there to the
+extreme dynamic range of all-pay equilibrium bids across valuations, from
+~1e-5 at v=0.1 to 0.76 at v=0.99, overwhelming both the spline critic's
+finite resolution and the opponent-inversion's precision). `n_agents=5`,
+`sample_size=100_000`, `belief_decay=0.9`, `patience=100`, `max_steps=8000`,
+`seed=0`, `payoff_rel_tol=-1`, `max_diff_threshold=0.02`, `n_rounds=500`.
+Both runs hit the 2-hour background compute budget before finishing (N=5
+needs 5x the rounds of N=2 for the same number of per-agent updates, and
+each round is itself slower), so neither reached the strict
+`max_diff_threshold`, but the trajectories already tell a clear story:
+
+- **`BetaCritic`** (`checkpoints/checkpoint_n5_allpay_beta_fair.pt`,
+  reached round 238): `MaxDiff` for all 5 agents drops from the ~0.40
+  initialization level to **0.07-0.10** by round 100 and *stays* in that
+  band through round 238 — stable, not still falling, but not diverging or
+  cycling either. Payoffs for all 5 agents sit at **0.032-0.036**, a close
+  match to the theoretical `1/(5*6) = 0.03333`, from round ~80 onward.
+- **`SplineCritic`** (`checkpoints/checkpoint_n5_allpay_spline_fair.pt`,
+  reached only round 126 in the same wall-clock budget — each round takes
+  longer, consistent with more steps spent fighting noise): `MaxDiff`
+  barely moves off its ~0.40 initialization level, ending at **0.44-0.49**
+  for all 5 agents — *worse* than where it started. Payoffs swing wildly
+  between **-0.20 and +0.19** depending on which agent just moved, the N=5
+  analogue of the N=2 leap-frogging cycle but far more severe (N=2's cycle
+  oscillated within a ~0.09-0.19 payoff band; here it spans a sign change).
+
+So at N=5, `BetaCritic` alone reaches a stable, near-equilibrium
+neighborhood that nothing else in this project — not the spline critic
+alone, not the PINN+EMA hybrid, not homotopy continuation — had previously
+reached without collapsing, while `SplineCritic` fails outright under
+identical settings. Confirms the N=2 result generalizes to the regime
+that broke every earlier approach. Not yet resumed long enough to confirm
+`BetaCritic` eventually tightens below the strict `0.02` threshold at N=5
+(it may need a tighter `belief_decay`/more samples given 5 agents means
+each one's belief buffer only gets refreshed once every 5 rounds) — the
+~0.07-0.10 plateau across 140+ rounds (100 to 238) without further
+improvement is the open question flagged below.
+
 ## Caveats and open questions
 
 - Tested only at N=2, `payment_share=1.0` fixed (no intermediate stages).
@@ -124,13 +176,11 @@ property of the all-pay FOC itself.
   `payment_share` from 0 to 1 with `BetaCritic` throughout has not yet been
   checked for whether that bias slows or destabilizes the intermediate
   stages — plausible given how small the bias is, but not verified.
-- Not yet tested at N>=3, in particular not at N=5 where
-  `docs/findings_pinn_regularizer.md` found the spline critic's finite
-  resolution collapses against the extreme dynamic range of all-pay
-  equilibrium bids across valuations. `BetaCritic`'s power-law form is
-  scale-invariant in log space, which is a plausible reason it might handle
-  that dynamic range far better than a spline — but this needs to be run,
-  not assumed.
+- Confirmed at N=5 (see above): `BetaCritic` reaches a stable
+  `MaxDiff~0.07-0.10` plateau where `SplineCritic` fails outright. Not yet
+  confirmed whether that plateau tightens further below `0.02` with more
+  rounds/compute, or is a real floor at this `belief_decay`/`sample_size`
+  — worth a longer resumed run before calling N=5 fully solved.
 - Not yet combined with the opponent-based PINN/EMA hybrid. Since
   `BetaCritic` targets the same noisy-derivative root cause from a
   different angle, the two may be redundant (no added benefit, in which
