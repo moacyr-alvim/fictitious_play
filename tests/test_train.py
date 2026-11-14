@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from fictitious_play.benchmark import equilibrium_bid_lambda
+from fictitious_play.benchmark import equilibrium_bid_lambda, equilibrium_bid_risk_averse
 from fictitious_play.critic import BetaCritic, SplineCritic
 from fictitious_play.train import (
     FictitiousPlayTrainer,
@@ -203,3 +203,62 @@ def test_critic_type_beta_wires_beta_critic_and_trains():
 def test_critic_type_rejects_unknown_value():
     with pytest.raises(ValueError):
         FictitiousPlayTrainer(n_agents=2, critic_type="not_a_real_type")
+
+
+def test_risk_aversion_rejects_n_agents_other_than_two():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=3, risk_aversion=[1.0, 1.0, 1.0])
+
+
+def test_risk_aversion_rejects_non_first_price():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, auction_type="all_pay", risk_aversion=[0.5, 1.0])
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, payment_share=0.5, risk_aversion=[0.5, 1.0])
+
+
+def test_risk_aversion_rejects_pinn_weight():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, risk_aversion=[0.5, 1.0], pinn_weight=0.1)
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, risk_aversion=[0.5, 1.0], pinn_opponent_weight=0.1)
+
+
+def test_risk_aversion_benchmark_metrics_use_per_agent_target():
+    """With different rho per agent, agent 0 and agent 1 are benchmarked
+    against *different* theoretical bid curves (the asymmetric equilibrium
+    solved in benchmark.equilibrium_bid_risk_averse), not a single shared
+    curve — the more risk-averse agent's curve sits above the less
+    risk-averse agent's for the same valuation (see
+    test_risk_averse_more_averse_agent_bids_more_aggressively)."""
+    trainer = FictitiousPlayTrainer(n_agents=2, risk_aversion=[0.3, 1.0], sample_size=100, seed=0)
+
+    class _ZeroActor:
+        def __call__(self, v):
+            return torch.zeros_like(v)
+
+    trainer.agents = [_ZeroActor(), _ZeroActor()]
+    # both agents now bid b=0 everywhere, so mse/max_diff are driven purely
+    # by how far 0 is from each agent's own target curve.
+    mse0, _ = trainer._benchmark_metrics(0)
+    mse1, _ = trainer._benchmark_metrics(1)
+    # both agents' curves converge to the *same* shared upper bid bound at
+    # v=1 (the common-support property the equilibrium is solved under — see
+    # _solve_asymmetric_risk_averse_equilibrium's docstring), so max_diff
+    # against an all-zero actor coincides for both; mse (averaged over the
+    # whole grid) still tells the curves apart, since the more risk-averse
+    # agent's curve rises faster and caps out earlier.
+    assert mse0 != mse1
+    v_mid = torch.tensor([[0.5]])
+    target0 = equilibrium_bid_risk_averse(v_mid, 0, tuple(trainer.risk_aversion)).item()
+    target1 = equilibrium_bid_risk_averse(v_mid, 1, tuple(trainer.risk_aversion)).item()
+    assert target0 != target1
+
+
+def test_risk_aversion_trains_without_error():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        risk_aversion=[0.5, 1.0], max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 3

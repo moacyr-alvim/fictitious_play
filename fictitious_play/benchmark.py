@@ -1,5 +1,10 @@
+from dataclasses import dataclass
+from functools import lru_cache
+
 import numpy as np
 import torch
+from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
 from scipy.optimize import brentq
 
 AUCTION_TYPES = ("first_price", "all_pay")
@@ -115,3 +120,123 @@ def theoretical_expected_payoff(n_agents: int = 2) -> float:
     payoff, throughout. Averaging over v ~ U[0, 1] gives 1 / (n * (n + 1)).
     """
     return 1.0 / (n_agents * (n_agents + 1))
+
+
+@dataclass
+class _AsymmetricRiskAverseEquilibrium:
+    b_bar: float
+    phi: tuple  # phi[i](b) -> P(agent i's bid < b): agent i's bid CDF, forward interpolators
+    beta: tuple  # beta[i](v) -> agent i's equilibrium bid, inverse interpolators
+
+
+@lru_cache(maxsize=32)
+def _solve_asymmetric_risk_averse_equilibrium(
+    risk_aversion: tuple[float, float], n_grid: int = 2000,
+) -> _AsymmetricRiskAverseEquilibrium:
+    """Numerically solves the Bayes-Nash equilibrium of a 2-bidder first-price
+    auction where both bidders draw v ~ Uniform(0, 1) but have different CRRA
+    risk-aversion coefficients rho_1, rho_2 (utility of winning with payoff
+    x = v - b is u_i(x) = x^rho_i; rho_i=1 is risk-neutral, rho_i in (0, 1) is
+    risk-averse).
+
+    Unlike every other equilibrium in this module, this one has no closed
+    form in general. Differentiating bidder i's objective
+    phi_j(b) * (v_i - b)^rho_i (phi_j = bidder j's inverse bid function, i.e.
+    its bid CDF) gives the coupled ODE system (b the shared independent
+    variable, phi_i(b) = bidder i's bid CDF evaluated at b):
+
+        d(phi_2)/db = phi_2(b) * rho_1 / (phi_1(b) - b)
+        d(phi_1)/db = phi_1(b) * rho_2 / (phi_2(b) - b)
+
+    with boundary conditions phi_1(0) = phi_2(0) = 0 and, at a shared upper
+    bound b_bar (both bidders' highest type bids the same maximum — the
+    standard regularity assumption for asymmetric first-price auctions, see
+    Marshall, Meurer, Richard & Stromquist 1994 and Maskin & Riley 2000),
+    phi_1(b_bar) = phi_2(b_bar) = 1.
+
+    b_bar is itself unknown (a free boundary): this is solved by *shooting*,
+    integrating the ODEs backward from b_bar (where they're regular; b=0 is
+    the singular end) down to b~0 for a trial b_bar, and bisecting on the
+    trial value until the backward solution reaches phi_1, phi_2 ~ 0
+    simultaneously (verified empirically to pin down a unique b_bar to
+    machine precision; for a wrong trial b_bar either the solution crosses
+    the phi_i(b)=b diagonal, where the ODE is singular, before reaching
+    b~0, or it doesn't reach phi~0 at all).
+
+    When rho_1 == rho_2 (symmetric case), this reduces to the closed form
+    b*(v) = v/(1+rho) (a special case of equilibrium_bid_lambda's formula
+    at payment_share=0, n_agents=2) — used directly without solving the ODE.
+
+    Correctness of the solved curves (the mutual Bayes-Nash best-response
+    property, not just the FOC) is checked in tests/test_benchmark.py by
+    directly re-optimizing each agent's objective against the other's solved
+    curve and comparing to the curve itself.
+    """
+    rho1, rho2 = risk_aversion
+    if abs(rho1 - rho2) < 1e-12:
+        c = 1.0 / (1.0 + rho1)
+        b_bar = c
+        linear = interp1d([0.0, c], [0.0, 1.0], fill_value=(0.0, 1.0), bounds_error=False)
+        beta = interp1d([0.0, 1.0], [0.0, c], fill_value=(0.0, c), bounds_error=False)
+        return _AsymmetricRiskAverseEquilibrium(b_bar, (linear, linear), (beta, beta))
+
+    def rhs(b, y):
+        phi1, phi2 = y
+        return [phi1 * rho2 / (phi2 - b), phi2 * rho1 / (phi1 - b)]
+
+    def crossed_diagonal(b, y):
+        return min(y[0] - b, y[1] - b) - 1e-6
+    crossed_diagonal.terminal = True
+    crossed_diagonal.direction = -1
+
+    def reaches_zero(b_bar_trial: float, b_stop: float = 1e-7) -> bool:
+        sol = solve_ivp(rhs, [b_bar_trial, b_stop], [1.0, 1.0], method="Radau",
+                         rtol=1e-9, atol=1e-11, events=crossed_diagonal)
+        return sol.t[-1] <= b_stop * 1.01
+
+    lo, hi = 1e-6, max(1.0 / (1.0 + rho1), 1.0 / (1.0 + rho2))
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if reaches_zero(mid):
+            lo = mid
+        else:
+            hi = mid
+    b_bar = lo
+
+    sol = solve_ivp(rhs, [b_bar, 1e-7], [1.0, 1.0], method="Radau",
+                     rtol=1e-10, atol=1e-12, dense_output=True, max_step=b_bar / 2000)
+    b_grid = np.linspace(1e-7, b_bar, n_grid)
+    phi1_grid = np.clip(sol.sol(b_grid)[0], 0.0, 1.0)
+    phi2_grid = np.clip(sol.sol(b_grid)[1], 0.0, 1.0)
+    b_grid = np.concatenate([[0.0], b_grid])
+    phi1_grid = np.concatenate([[0.0], phi1_grid])
+    phi2_grid = np.concatenate([[0.0], phi2_grid])
+
+    phi1 = interp1d(b_grid, phi1_grid, bounds_error=False, fill_value=(0.0, 1.0))
+    phi2 = interp1d(b_grid, phi2_grid, bounds_error=False, fill_value=(0.0, 1.0))
+    beta1 = interp1d(phi1_grid, b_grid, bounds_error=False, fill_value=(0.0, b_bar))
+    beta2 = interp1d(phi2_grid, b_grid, bounds_error=False, fill_value=(0.0, b_bar))
+    return _AsymmetricRiskAverseEquilibrium(b_bar, (phi1, phi2), (beta1, beta2))
+
+
+def equilibrium_bid_risk_averse(v: torch.Tensor, agent_idx: int,
+                                 risk_aversion: tuple[float, float]) -> torch.Tensor:
+    """Agent agent_idx's equilibrium bid in the 2-bidder asymmetric-CRRA
+    first-price auction described in _solve_asymmetric_risk_averse_equilibrium.
+    """
+    eq = _solve_asymmetric_risk_averse_equilibrium(tuple(risk_aversion))
+    v_np = v.detach().cpu().numpy()
+    b_np = eq.beta[agent_idx](v_np)
+    return torch.tensor(b_np, dtype=v.dtype, device=v.device).reshape(v.shape)
+
+
+def theoretical_win_probability_risk_averse(b: torch.Tensor, agent_idx: int,
+                                             risk_aversion: tuple[float, float]) -> torch.Tensor:
+    """P(win | b) for agent agent_idx against its (single) opponent, both
+    playing the equilibrium described in _solve_asymmetric_risk_averse_equilibrium
+    — i.e. the opponent's bid CDF evaluated at b."""
+    eq = _solve_asymmetric_risk_averse_equilibrium(tuple(risk_aversion))
+    opponent_idx = 1 - agent_idx
+    b_np = b.detach().cpu().numpy()
+    p_np = eq.phi[opponent_idx](b_np)
+    return torch.tensor(p_np, dtype=b.dtype, device=b.device).reshape(b.shape)

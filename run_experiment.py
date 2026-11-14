@@ -57,6 +57,14 @@ def parse_args():
                          help="Decay of the EMA shadow actor foc_residual_opponent inverts "
                               "against, giving it belief-buffer-like memory. Only matters if "
                               "--pinn-opponent-weight > 0.")
+    parser.add_argument("--risk-aversion", type=float, nargs=2, default=None,
+                         metavar=("RHO0", "RHO1"),
+                         help="Per-agent CRRA risk-aversion coefficient (rho=1 is risk-neutral, "
+                              "rho in (0,1) is risk-averse: u_i(x)=x^rho_i on the payoff if "
+                              "winning). Only n_agents=2, first-price (--auction-type "
+                              "first_price), and incompatible with --pinn-weight/"
+                              "--pinn-opponent-weight > 0 — see "
+                              "fictitious_play.benchmark.equilibrium_bid_risk_averse.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -82,7 +90,7 @@ def main():
         actor_hidden_size=args.actor_hidden_size,
         auction_type=args.auction_type, payoff_weight=args.payoff_weight,
         pinn_weight=args.pinn_weight, pinn_opponent_weight=args.pinn_opponent_weight,
-        opponent_ema_decay=args.opponent_ema_decay,
+        opponent_ema_decay=args.opponent_ema_decay, risk_aversion=args.risk_aversion,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

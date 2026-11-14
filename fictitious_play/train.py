@@ -5,10 +5,30 @@ import numpy as np
 import torch
 
 from .actor import Actor
-from .benchmark import AUCTION_TYPES, equilibrium_bid, equilibrium_bid_lambda, theoretical_expected_payoff
+from .benchmark import (
+    AUCTION_TYPES,
+    equilibrium_bid,
+    equilibrium_bid_lambda,
+    equilibrium_bid_risk_averse,
+    theoretical_expected_payoff,
+    theoretical_win_probability_risk_averse,
+)
 from .critic import BetaCritic, SplineCritic
 
 CRITIC_TYPES = ("spline", "beta")
+
+
+def crra_utility(x: torch.Tensor, rho: float, eps: float = 1e-6) -> torch.Tensor:
+    """Sign-preserving extension of the CRRA power utility x^rho to all
+    reals: sign(x) * |x|^rho. Classical CRRA utility is only defined for
+    x >= 0 (a rational bidder never pays more than their value), but the
+    actor can transiently bid above value during training, so the loss
+    needs a well-defined, differentiable value everywhere. |x| is clamped
+    away from exactly 0 since rho < 1 makes the derivative diverge there
+    (a real feature of CRRA, not a bug — see BetaCritic's analogous clamp
+    in fictitious_play.critic)."""
+    abs_x = x.abs().clamp(min=eps)
+    return x.sign() * abs_x ** rho
 
 
 def foc_residual(p_win: torch.Tensor, b: torch.Tensor, v: torch.Tensor, lam: float) -> torch.Tensor:
@@ -163,6 +183,7 @@ class FictitiousPlayTrainer:
                  actor_hidden_size: int = 32,
                  freeze_mode: str = "none", unfreeze_after_rounds: int = 20,
                  auction_type: str = "first_price", payment_share: float | None = None,
+                 risk_aversion: list[float] | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
                  pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
                  opponent_ema_decay_schedule: tuple[float, float] | None = None,
@@ -184,6 +205,30 @@ class FictitiousPlayTrainer:
         # for homotopy continuation: step payment_share from 0 to 1 across
         # training stages, warm-starting each stage from the previous one.
         self.payment_share = payment_share
+        # Per-agent CRRA risk-aversion coefficient (u_i(x) = x^rho_i on the
+        # payoff if winning; rho_i=1 is risk-neutral, rho_i in (0,1) is
+        # risk-averse). Only supported for n_agents=2, pure first-price
+        # (payment_share=0 or auction_type="first_price" with payment_share
+        # unset): the theoretical ground truth
+        # (benchmark.equilibrium_bid_risk_averse) is a numerically-solved
+        # asymmetric auction equilibrium (no closed form when rho_1!=rho_2 —
+        # see its docstring), only derived for that case. Not compatible
+        # with pinn_weight/pinn_opponent_weight: their FOC formulas assume
+        # risk-neutral (linear) utility.
+        if risk_aversion is not None:
+            if n_agents != 2:
+                raise ValueError("risk_aversion is only supported for n_agents=2")
+            if len(risk_aversion) != n_agents:
+                raise ValueError("risk_aversion must have one coefficient per agent")
+            is_first_price = (payment_share == 0.0 or
+                               (payment_share is None and auction_type == "first_price"))
+            if not is_first_price:
+                raise ValueError("risk_aversion is only supported for first-price "
+                                  "(payment_share=0 or auction_type='first_price')")
+            if pinn_weight > 0 or pinn_opponent_weight > 0:
+                raise ValueError("risk_aversion is not compatible with pinn_weight/"
+                                  "pinn_opponent_weight (their FOC assumes risk-neutral utility)")
+        self.risk_aversion = list(risk_aversion) if risk_aversion is not None else None
         # Weight on the usual critic-based expected-payoff loss (1.0 =
         # plain fictitious play). Set to 0 together with pinn_weight=0 to
         # train purely on pinn_opponent_weight's residual instead.
@@ -551,10 +596,17 @@ class FictitiousPlayTrainer:
             if self.payoff_weight > 0 or self.pinn_weight > 0:
                 p_win = critic.predict_win_prob(b.squeeze(1)).unsqueeze(1)
                 if self.payoff_weight > 0:
-                    # Generalized payment rule: winner pays b, losers pay
-                    # lam * b. E[payoff] = P(win)*(v - (1-lam)*b) - lam*b
-                    # (lam=0 recovers first-price, lam=1 recovers all-pay).
-                    payoff_loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
+                    if self.risk_aversion is not None:
+                        # Expected CRRA utility instead of expected monetary
+                        # payoff (risk_aversion validated to first-price only,
+                        # so losers pay nothing and there's no -lam*b term).
+                        rho = self.risk_aversion[mover_idx]
+                        payoff_loss = -(p_win * crra_utility(v - b, rho)).mean()
+                    else:
+                        # Generalized payment rule: winner pays b, losers pay
+                        # lam * b. E[payoff] = P(win)*(v - (1-lam)*b) - lam*b
+                        # (lam=0 recovers first-price, lam=1 recovers all-pay).
+                        payoff_loss = -(p_win * (v - (1 - lam) * b) - lam * b).mean()
                     loss = loss + self.payoff_weight * payoff_loss
                 if self.pinn_weight > 0:
                     # Physics-informed regularizer: penalize violation of the
@@ -586,15 +638,19 @@ class FictitiousPlayTrainer:
 
         return steps_taken
 
-    def _benchmark_metrics(self, actor: Actor) -> tuple[float, float]:
-        """Returns (mse, max_abs_diff) of the actor's bid function against
+    def _benchmark_metrics(self, agent_idx: int) -> tuple[float, float]:
+        """Returns (mse, max_abs_diff) of agent_idx's bid function against
         the known equilibrium, over the evaluation grid. mse is logged only
         as a diagnostic; max_abs_diff (the sup-norm deviation) drives the
         stopping decision, since it cannot be satisfied while a whole
         region of valuations is still poorly fit — unlike an average."""
+        actor = self.agents[agent_idx]
         with torch.no_grad():
             pred = actor(self.eval_grid)
-            if self.payment_share is not None:
+            if self.risk_aversion is not None:
+                target = equilibrium_bid_risk_averse(self.eval_grid, agent_idx,
+                                                      tuple(self.risk_aversion))
+            elif self.payment_share is not None:
                 target = equilibrium_bid_lambda(self.eval_grid, self.n_agents, self.payment_share)
             else:
                 target = equilibrium_bid(self.eval_grid, self.n_agents, self.auction_type)
@@ -743,7 +799,7 @@ class FictitiousPlayTrainer:
             self._update_belief(mover_idx)
             self._update_opponent_ema(mover_idx)
 
-            metrics = [self._benchmark_metrics(self.agents[i]) for i in range(self.n_agents)]
+            metrics = [self._benchmark_metrics(i) for i in range(self.n_agents)]
             mse = [m[0] for m in metrics]
             max_diff = [m[1] for m in metrics]
             payoff = [self._expected_payoff(i) for i in range(self.n_agents)]
@@ -759,9 +815,16 @@ class FictitiousPlayTrainer:
                 mse_str = " ".join(f"MSE{i}={m:.6f}" for i, m in enumerate(mse))
                 maxdiff_str = " ".join(f"MaxDiff{i}={d:.5f}" for i, d in enumerate(max_diff))
                 payoff_str = " ".join(f"P{i}={p:.5f}" for i, p in enumerate(payoff))
-                theo = theoretical_expected_payoff(self.n_agents)
+                if self.risk_aversion is not None:
+                    # No single theoretical payoff applies: risk_aversion
+                    # makes the auction allocation inefficient (bid-shading
+                    # factors differ per agent), breaking the revenue-
+                    # equivalence argument theoretical_expected_payoff relies on.
+                    theo_str = "teórico=n/a (risk_aversion)"
+                else:
+                    theo_str = f"teórico={theoretical_expected_payoff(self.n_agents):.5f}"
                 print(f"Round {round_idx:3d} | mover=agent{mover_idx} | steps={steps_taken:5d} "
-                      f"| {mse_str} | {maxdiff_str} | {payoff_str} | teórico={theo:.5f}")
+                      f"| {mse_str} | {maxdiff_str} | {payoff_str} | {theo_str}")
 
             max_diff_ok = self._max_diff_converged(max_diff)
             payoff_ok = self._payoff_converged()

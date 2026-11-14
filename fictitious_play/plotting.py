@@ -4,9 +4,11 @@ import torch
 from .benchmark import (
     equilibrium_bid,
     equilibrium_bid_lambda,
+    equilibrium_bid_risk_averse,
     theoretical_expected_payoff,
     theoretical_win_probability,
     theoretical_win_probability_lambda,
+    theoretical_win_probability_risk_averse,
 )
 from .train import FictitiousPlayTrainer
 
@@ -37,12 +39,16 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.close()
 
     payoff_per_agent = list(zip(*(h["payoff"] for h in history)))
-    theo_payoff = theoretical_expected_payoff(n_agents)
 
     plt.figure()
     for i, payoff_series in enumerate(payoff_per_agent):
         plt.plot(rounds, payoff_series, label=f"Agente {i}")
-    plt.axhline(theo_payoff, color="black", linestyle="--", label="Payoff teórico")
+    if trainer.risk_aversion is None:
+        # With risk_aversion, bid-shading differs per agent, so the auction
+        # isn't efficient and there's no single theoretical payoff shared by
+        # all agents (see theoretical_expected_payoff's docstring).
+        plt.axhline(theoretical_expected_payoff(n_agents), color="black", linestyle="--",
+                    label="Payoff teórico")
     _mark_growth_stages(growth_rounds)
     plt.xlabel("Rodada")
     plt.ylabel("Payoff médio esperado")
@@ -53,7 +59,10 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     plt.close()
 
     payment_share = trainer.payment_share
-    if payment_share is not None:
+    risk_aversion = trainer.risk_aversion
+    if risk_aversion is not None:
+        label_suffix = f"first_price, risk_aversion={risk_aversion}"
+    elif payment_share is not None:
         label_suffix = f"payment_share={payment_share:.2f}"
         bid_formula = f"b*(v) = (N-1)v^N / (N*[(1-{payment_share:.2f})v^(N-1)+{payment_share:.2f}])"
     else:
@@ -63,18 +72,23 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
 
     v_grid = torch.linspace(0, 1, 200, device=trainer.device).unsqueeze(1)
     with torch.no_grad():
-        if payment_share is not None:
-            b_star = equilibrium_bid_lambda(v_grid, n_agents, payment_share).squeeze(1).cpu()
-        else:
-            b_star = equilibrium_bid(v_grid, n_agents, trainer.auction_type).squeeze(1).cpu()
         v_grid_cpu = v_grid.squeeze(1).cpu()
         bids = [trainer.agents[i](v_grid).squeeze(1).cpu() for i in range(n_agents)]
+        if risk_aversion is None:
+            if payment_share is not None:
+                b_star = equilibrium_bid_lambda(v_grid, n_agents, payment_share).squeeze(1).cpu()
+            else:
+                b_star = equilibrium_bid(v_grid, n_agents, trainer.auction_type).squeeze(1).cpu()
 
     plt.figure()
     for i, b in enumerate(bids):
         plt.plot(v_grid_cpu, b, label=f"Agente {i} (aprendido)")
-    plt.plot(v_grid_cpu, b_star, "--", color="black",
-              label=f"Equilíbrio teórico {bid_formula}")
+        if risk_aversion is not None:
+            b_star_i = equilibrium_bid_risk_averse(v_grid, i, tuple(risk_aversion)).squeeze(1).cpu()
+            plt.plot(v_grid_cpu, b_star_i, "--", label=f"Agente {i} (teórico, rho={risk_aversion[i]})")
+    if risk_aversion is None:
+        plt.plot(v_grid_cpu, b_star, "--", color="black",
+                  label=f"Equilíbrio teórico {bid_formula}")
     plt.xlabel("Valor v")
     plt.ylabel("Lance b")
     plt.legend()
@@ -87,7 +101,10 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     b_grid = torch.linspace(0, 1, 300, device=trainer.device)
     with torch.no_grad():
         learned_p_win = critic.predict_win_prob(b_grid).cpu()
-        if payment_share is not None:
+        if risk_aversion is not None:
+            theoretical_p_win = theoretical_win_probability_risk_averse(
+                b_grid, critic_agent, tuple(risk_aversion)).cpu()
+        elif payment_share is not None:
             theoretical_p_win = theoretical_win_probability_lambda(b_grid, n_agents, payment_share).cpu()
         else:
             theoretical_p_win = theoretical_win_probability(b_grid, n_agents, trainer.auction_type).cpu()
