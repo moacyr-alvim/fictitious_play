@@ -284,3 +284,25 @@ def test_risk_aversion_trains_without_error():
     )
     history = trainer.run(verbose=False)
     assert len(history) == 3
+
+
+def test_set_risk_aversion_updates_coefficients_and_marks_stage_boundary():
+    trainer = FictitiousPlayTrainer(n_agents=2, risk_aversion=[1.0, 1.0], sample_size=100, seed=0)
+    trainer.history.append({"round": 0})  # simulate a stage already having run
+
+    trainer.set_risk_aversion([0.7, 1.0])
+
+    assert trainer.risk_aversion == [0.7, 1.0]
+    assert trainer.growth_rounds == [1]
+
+
+def test_set_risk_aversion_rejects_wrong_length():
+    trainer = FictitiousPlayTrainer(n_agents=2, risk_aversion=[1.0, 1.0], sample_size=100, seed=0)
+    with pytest.raises(ValueError):
+        trainer.set_risk_aversion([0.5])
+
+
+def test_set_risk_aversion_requires_risk_aversion_already_set():
+    trainer = FictitiousPlayTrainer(n_agents=2, sample_size=100, seed=0)
+    with pytest.raises(ValueError):
+        trainer.set_risk_aversion([0.5, 1.0])

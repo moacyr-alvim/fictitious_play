@@ -358,6 +358,25 @@ class FictitiousPlayTrainer:
         self.payment_share = new_payment_share
         self.growth_rounds.append(len(self.history))
 
+    def set_risk_aversion(self, new_risk_aversion: list[float]) -> None:
+        """Moves to a new point on the risk-aversion continuum (e.g. a
+        homotopy ramp from risk-neutral [1.0, 1.0] towards some asymmetric
+        target), the same way set_payment_share moves along the lambda
+        continuum. Like set_payment_share, this touches no actor
+        parameters — the warm start is implicit, since only the payoff/FOC
+        formulas in _best_response and the benchmark target in
+        _benchmark_metrics depend on risk_aversion. Only valid if
+        risk_aversion was already set at construction time (this auction
+        variant is validated only for n_agents=2, first-price — see the
+        constructor)."""
+        if self.risk_aversion is None:
+            raise ValueError("set_risk_aversion requires risk_aversion to already be set "
+                              "(this trainer was not constructed with a risk_aversion auction)")
+        if len(new_risk_aversion) != self.n_agents:
+            raise ValueError("risk_aversion must have one coefficient per agent")
+        self.risk_aversion = list(new_risk_aversion)
+        self.growth_rounds.append(len(self.history))
+
     def add_agents(self, additional_agents: int, copy_from: int = 0) -> None:
         """Grows the game itself by adding more agents, each warm-started
         as a copy of copy_from's current actor — reasonable since a
@@ -739,6 +758,7 @@ class FictitiousPlayTrainer:
             "n_agents": self.n_agents,
             "auction_type": self.auction_type,
             "payment_share": self.payment_share,
+            "risk_aversion": self.risk_aversion,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -799,6 +819,8 @@ class FictitiousPlayTrainer:
         self.growth_rounds = checkpoint.get("growth_rounds", [])
         self.auction_type = checkpoint.get("auction_type", "first_price")
         self.payment_share = checkpoint.get("payment_share")
+        if "risk_aversion" in checkpoint:
+            self.risk_aversion = checkpoint["risk_aversion"]
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
