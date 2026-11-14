@@ -49,11 +49,14 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
         # all agents (see theoretical_expected_payoff's docstring).
         plt.axhline(theoretical_expected_payoff(n_agents), color="black", linestyle="--",
                     label="Payoff teórico")
+        title = f"Payoff médio esperado vs. teórico (N={n_agents})"
+    else:
+        title = f"Payoff médio esperado (N={n_agents}, risk_aversion={trainer.risk_aversion})"
     _mark_growth_stages(growth_rounds)
     plt.xlabel("Rodada")
     plt.ylabel("Payoff médio esperado")
     plt.legend()
-    plt.title(f"Payoff médio esperado vs. teórico (N={n_agents})")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(f"payoff{tag}.png", dpi=150)
     plt.close()
