@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
-from fictitious_play.critic import BetaCritic, SplineCritic
+from fictitious_play.critic import BetaCritic, MonotonicNNCritic, SplineCritic
 
 
 def test_cdf_matches_uniform_distribution():
@@ -133,3 +133,92 @@ def test_beta_critic_handles_degenerate_zero_bids():
     query = torch.tensor([0.0, 0.5, 1.0])
     predicted = critic.predict_win_prob(query)
     assert torch.all(torch.isfinite(predicted))
+
+
+def test_monotonic_nn_critic_matches_uniform_distribution():
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    bids = rng.uniform(0.0, 0.5, size=50_000)
+
+    critic = MonotonicNNCritic()
+    critic.fit(bids)
+
+    query = torch.tensor([0.0, 0.1, 0.25, 0.4, 0.5])
+    with torch.no_grad():
+        predicted = critic.predict_win_prob(query)
+    expected = torch.tensor([0.0, 0.2, 0.5, 0.8, 1.0])
+    assert torch.allclose(predicted, expected, atol=0.05)
+
+
+def test_monotonic_nn_critic_is_monotonic_by_construction():
+    """Checked over a batch of *random* re-initializations (not just the
+    one fit to a real distribution above): monotonicity has to hold for
+    any weights the optimizer could possibly reach, since it comes from
+    the architecture (positive weights, monotonic activations), not from
+    what fit() converges to."""
+    torch.manual_seed(1)
+    query = torch.linspace(0.0, 1.0, 200)
+    for _ in range(5):
+        critic = MonotonicNNCritic()
+        with torch.no_grad():
+            predicted = critic.predict_win_prob(query)
+        diffs = predicted[1:] - predicted[:-1]
+        assert torch.all(diffs >= -1e-6)
+
+
+def test_monotonic_nn_critic_gradient_flows_through_bid():
+    torch.manual_seed(2)
+    rng = np.random.default_rng(2)
+    bids = rng.uniform(0.0, 0.5, size=50_000)
+
+    critic = MonotonicNNCritic()
+    critic.fit(bids)
+
+    b = torch.tensor([0.3], requires_grad=True)
+    p_win = critic.predict_win_prob(b)
+    p_win.backward()
+
+    assert b.grad is not None
+    assert b.grad.item() > 0
+
+
+def test_monotonic_nn_critic_warm_start_adapts_to_shifted_distribution():
+    """fit() is meant to be called repeatedly on the same instance as the
+    underlying distribution drifts round to round (see the class
+    docstring), continuing from the current weights/optimizer state rather
+    than restarting — check that a second fit() call on a different
+    (wider) distribution actually moves the prediction, rather than being
+    stuck at the first fit's solution."""
+    torch.manual_seed(3)
+    rng = np.random.default_rng(3)
+    critic = MonotonicNNCritic(fit_steps=500)
+    critic.fit(rng.uniform(0.0, 0.3, size=20_000))
+    with torch.no_grad():
+        first = critic.predict_win_prob(torch.tensor([0.5])).item()
+
+    critic.fit(rng.uniform(0.0, 0.8, size=20_000))
+    with torch.no_grad():
+        second = critic.predict_win_prob(torch.tensor([0.5])).item()
+
+    assert first > 0.9  # 0.5 is well past the first (narrower) distribution's range
+    assert second < 0.8  # ...but well inside the second (wider) one's range
+    assert abs(second - 0.625) < 0.1  # true CDF value at 0.5 under Uniform(0, 0.8)
+
+
+def test_monotonic_nn_critic_state_dict_round_trip():
+    rng = np.random.default_rng(4)
+    bids = rng.uniform(0.0, 0.5, size=10_000)
+
+    critic = MonotonicNNCritic(fit_steps=100)
+    critic.fit(bids)
+    query = torch.linspace(0.0, 1.0, 20)
+    with torch.no_grad():
+        before = critic.predict_win_prob(query)
+
+    state = critic.state_dict()
+    restored = MonotonicNNCritic(fit_steps=100)
+    restored.load_state_dict(state)
+    with torch.no_grad():
+        after = restored.predict_win_prob(query)
+
+    assert torch.allclose(before, after)

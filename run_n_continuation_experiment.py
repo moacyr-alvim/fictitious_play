@@ -30,7 +30,8 @@ def parse_args():
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=1000)
-    parser.add_argument("--critic-type", type=str, default="spline", choices=["spline", "beta"])
+    parser.add_argument("--critic-type", type=str, default="spline",
+                         choices=["spline", "beta", "nn"])
     parser.add_argument("--checkpoint-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--critic-agent", type=int, default=0)

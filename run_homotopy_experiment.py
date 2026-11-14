@@ -26,7 +26,8 @@ def parse_args():
     parser.add_argument("--payoff-rel-tol", type=float, default=0.08)
     parser.add_argument("--payoff-window", type=int, default=10)
     parser.add_argument("--critic-n-quantiles", type=int, default=1000)
-    parser.add_argument("--critic-type", type=str, default="spline", choices=["spline", "beta"])
+    parser.add_argument("--critic-type", type=str, default="spline",
+                         choices=["spline", "beta", "nn"])
     parser.add_argument("--payoff-weight", type=float, default=1.0,
                          help="Weight of the usual critic-based expected-payoff loss. Set to 0 "
                               "(together with --pinn-weight 0) for a pure PINN run driven only "

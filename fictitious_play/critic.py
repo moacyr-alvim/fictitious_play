@@ -147,3 +147,116 @@ class BetaCritic:
         # the derivative there is 0.
         x = (bids / self.scale).clamp(self.eps, 1.0)
         return x ** self.alpha
+
+
+class MonotonicNNCritic:
+    """Estimates P(win | b) = P(opponent's bid < b) with a small neural
+    network constrained to be monotonically non-decreasing in b *by
+    construction* (every weight strictly positive, every activation itself
+    monotonically non-decreasing — a composition of monotonic functions
+    with positive-weighted sums is itself monotonic), fit by gradient
+    descent against the same empirical quantiles SplineCritic interpolates.
+
+    Positioned between SplineCritic and BetaCritic on the bias/variance
+    trade-off the other two sit at opposite ends of (see
+    docs/findings_risk_aversion.md and docs/findings_beta_critic.md):
+    BetaCritic is exactly unbiased only when the opponent's bid
+    distribution truly is Beta(alpha, 1)-shaped (first-price, all-pay, the
+    payment_share continuum between them) and visibly biased otherwise (the
+    asymmetric risk-aversion auction); SplineCritic has no shape assumption
+    at all but pays for that in sampling variance. A small monotonic MLP
+    has neither a hard-coded parametric shape nor the spline's per-quantile
+    interpolation noise, at the cost of needing its own (short, warm-
+    started) training loop each round instead of a closed-form fit.
+
+    Two implementation choices were tuned empirically rather than guessed:
+
+    - **2 hidden layers, not 1.** A single hidden layer (however wide, however
+      long trained) plateaus at a ~0.09 max CDF error fitting the curved
+      asymmetric-risk-aversion equilibrium — a genuine capacity limit of
+      that shape, not an optimization issue (more steps/width didn't help).
+      Stacking a second monotonic hidden layer (same positive-weight +
+      softplus/tanh construction) drops that to ~0.002-0.007: a materially
+      more expressive monotonic family for about the same parameter count.
+    - **Regression against empirical quantiles (MSE), not BCE against random
+      (query, opponent-sample) pairs.** The latter is the more obvious
+      training signal (a random query q and opponent draw x give a
+      Bernoulli sample of P(win|q) = F(q) via the indicator 1[x<q], so BCE
+      against many such pairs is a standard classifier-based way to fit a
+      CDF) and is what this was first implemented with, but needed
+      5,000-15,000 steps to approach BetaCritic's accuracy on the
+      asymmetric risk-aversion case and still didn't clearly beat it.
+      Regressing directly against a few hundred empirical quantiles (the
+      same (bid, level) pairs SplineCritic already computes) is a far less
+      noisy target and converges in ~2,000 steps to an error an order of
+      magnitude lower.
+
+    Unlike SplineCritic/BetaCritic, fitting is itself a short gradient-
+    descent loop, not a closed-form computation — meant to be *warm-started*
+    round to round (fit() keeps refining the same weights and the same
+    Adam optimizer state rather than starting over), the same way each
+    agent's actor already warm-starts across rounds. Callers should keep
+    one persistent instance per agent (see FictitiousPlayTrainer.nn_critics)
+    rather than constructing a fresh one every round.
+    """
+
+    def __init__(self, hidden_size: int = 32, n_layers: int = 2, lr: float = 1e-2,
+                 n_quantiles: int = 400, fit_steps: int = 2000,
+                 device: torch.device | str | None = None):
+        self.device = torch.device(device) if device else torch.device("cpu")
+        self.n_quantiles = n_quantiles
+        self.fit_steps = fit_steps
+        sizes = [1] + [hidden_size] * n_layers + [1]
+        self._raw_weights = [
+            torch.nn.Parameter(torch.randn(sizes[i], sizes[i + 1], device=self.device) * 0.5)
+            for i in range(len(sizes) - 1)
+        ]
+        self._biases = [
+            torch.nn.Parameter(torch.zeros(sizes[i + 1], device=self.device))
+            for i in range(len(sizes) - 1)
+        ]
+        self._optimizer = torch.optim.Adam(self._raw_weights + self._biases, lr=lr)
+
+    def state_dict(self) -> dict:
+        return {
+            "raw_weights": [w.detach().clone() for w in self._raw_weights],
+            "biases": [b.detach().clone() for b in self._biases],
+            "optimizer": self._optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        with torch.no_grad():
+            for w, saved in zip(self._raw_weights, state["raw_weights"]):
+                w.copy_(saved)
+            for b, saved in zip(self._biases, state["biases"]):
+                b.copy_(saved)
+        self._optimizer.load_state_dict(state["optimizer"])
+
+    def _forward(self, bids: torch.Tensor) -> torch.Tensor:
+        # softplus reparametrization keeps every weight strictly positive
+        # without constraining the optimizer directly; tanh is monotonic
+        # non-decreasing (tanh' = 1 - tanh^2 >= 0), as is the final sigmoid,
+        # so d(output)/d(bids) is a sum/product of nonnegative terms
+        # regardless of the (unconstrained) biases.
+        x = bids.reshape(-1, 1)
+        for i, (w_raw, bias) in enumerate(zip(self._raw_weights, self._biases)):
+            w = torch.nn.functional.softplus(w_raw)
+            x = x @ w + bias
+            if i < len(self._raw_weights) - 1:
+                x = torch.tanh(x)
+        return torch.sigmoid(x).reshape(bids.shape)
+
+    def fit(self, opponent_bids: np.ndarray) -> None:
+        levels = np.linspace(0.0, 1.0, self.n_quantiles)
+        bid_points = np.quantile(opponent_bids, levels)
+        x = torch.tensor(bid_points, dtype=torch.float32, device=self.device)
+        y = torch.tensor(levels, dtype=torch.float32, device=self.device)
+        for _ in range(self.fit_steps):
+            pred = self._forward(x)
+            loss = torch.nn.functional.mse_loss(pred, y)
+            self._optimizer.zero_grad()
+            loss.backward()
+            self._optimizer.step()
+
+    def predict_win_prob(self, bids: torch.Tensor) -> torch.Tensor:
+        return self._forward(bids)

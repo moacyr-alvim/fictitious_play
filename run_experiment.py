@@ -30,12 +30,17 @@ def parse_args():
                          help="Number of quantile points the spline critic is fit on. "
                               "Ignored if --critic-type beta.")
     parser.add_argument("--critic-type", type=str, default="spline",
-                         choices=["spline", "beta"],
+                         choices=["spline", "beta", "nn"],
                          help="spline: monotone cubic Hermite spline over empirical quantiles "
                               "(fictitious_play.critic.SplineCritic). beta: fit a scaled "
                               "Beta(alpha, 1) distribution (2 parameters) instead — exact at "
                               "the first-price and all-pay equilibria, lower variance, exact "
-                              "analytic derivative (see fictitious_play.critic.BetaCritic).")
+                              "analytic derivative, but visibly biased on auction variants "
+                              "whose equilibrium isn't power-law-shaped (see "
+                              "fictitious_play.critic.BetaCritic). nn: a small neural network "
+                              "constrained to be monotonic by construction, warm-started "
+                              "across rounds — more flexible than beta, lower-variance than "
+                              "spline (see fictitious_play.critic.MonotonicNNCritic).")
     parser.add_argument("--actor-hidden-size", type=int, default=32,
                          help="Hidden units in the actor's single hidden layer (0 = no hidden "
                               "layer, a constant shading factor).")

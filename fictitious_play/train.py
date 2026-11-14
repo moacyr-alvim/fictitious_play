@@ -13,9 +13,9 @@ from .benchmark import (
     theoretical_expected_payoff,
     theoretical_win_probability_risk_averse,
 )
-from .critic import BetaCritic, SplineCritic
+from .critic import BetaCritic, MonotonicNNCritic, SplineCritic
 
-CRITIC_TYPES = ("spline", "beta")
+CRITIC_TYPES = ("spline", "beta", "nn")
 
 
 def crra_utility(x: torch.Tensor, rho: float, eps: float = 1e-6) -> torch.Tensor:
@@ -298,6 +298,13 @@ class FictitiousPlayTrainer:
             for p in shadow.parameters():
                 p.requires_grad_(False)
         self.belief_buffers = [self._fresh_bids(i) for i in range(n_agents)]
+        # One persistent MonotonicNNCritic per agent, warm-started round to
+        # round (see critic.MonotonicNNCritic's docstring) instead of
+        # rebuilt from scratch every time — only actually fit/used when
+        # critic_type="nn", but always constructed for the same reason
+        # ema_agents always is, regardless of whether the feature that
+        # needs it is enabled.
+        self.nn_critics = [MonotonicNNCritic(device=self.device) for _ in range(n_agents)]
         self.history: list[dict] = []
         self.growth_rounds: list[int] = []
         self._frozen_since_round: int | None = None
@@ -384,6 +391,8 @@ class FictitiousPlayTrainer:
             for p in shadow.parameters():
                 p.requires_grad_(False)
             self.ema_agents.append(shadow)
+
+            self.nn_critics.append(MonotonicNNCritic(device=self.device))
 
         self.n_agents += additional_agents
         self.belief_buffers = [self._fresh_bids(i) for i in range(self.n_agents)]
@@ -554,22 +563,28 @@ class FictitiousPlayTrainer:
                  for idx in opponent_indices]
         return np.maximum.reduce(draws)
 
-    def _new_critic(self) -> SplineCritic | BetaCritic:
+    def _new_critic(self, mover_idx: int) -> SplineCritic | BetaCritic | MonotonicNNCritic:
         if self.critic_type == "beta":
             return BetaCritic(device=self.device)
+        if self.critic_type == "nn":
+            # Persistent, warm-started across rounds (see
+            # MonotonicNNCritic's docstring) rather than a fresh instance.
+            return self.nn_critics[mover_idx]
         return SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
 
-    def critic_for(self, mover_idx: int) -> SplineCritic | BetaCritic:
-        """Fits (without training) the critic mover_idx currently faces,
-        i.e. the smoothed CDF of the max bid drawn from the other agents'
-        belief buffers."""
+    def critic_for(self, mover_idx: int) -> SplineCritic | BetaCritic | MonotonicNNCritic:
+        """Fits (without training the *actor*) the critic mover_idx
+        currently faces, i.e. the smoothed CDF of the max bid drawn from
+        the other agents' belief buffers."""
         opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
         opponent_bids = self._sample_max_belief_bids(opponent_indices)
-        critic = self._new_critic()
+        critic = self._new_critic(mover_idx)
         critic.fit(opponent_bids)
         return critic
 
-    def _best_response(self, mover_idx: int, critic: SplineCritic | BetaCritic) -> int:
+    def _best_response(
+        self, mover_idx: int, critic: SplineCritic | BetaCritic | MonotonicNNCritic
+    ) -> int:
         actor = self.agents[mover_idx]
         optimizer = self.optimizers[mover_idx]
 
@@ -728,6 +743,7 @@ class FictitiousPlayTrainer:
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
             "ema_agents": [a.state_dict() for a in self.ema_agents],
+            "nn_critics": [c.state_dict() for c in self.nn_critics],
             "optimizers": [o.state_dict() for o in self.optimizers],
             "belief_buffers": self.belief_buffers,
             "history": self.history,
@@ -769,6 +785,11 @@ class FictitiousPlayTrainer:
             for p in shadow.parameters():
                 p.requires_grad_(False)
 
+        self.nn_critics = [MonotonicNNCritic(device=self.device) for _ in self.agents]
+        if "nn_critics" in checkpoint:
+            for critic, state in zip(self.nn_critics, checkpoint["nn_critics"]):
+                critic.load_state_dict(state)
+
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]
         for optimizer, state in zip(self.optimizers, checkpoint["optimizers"]):
             optimizer.load_state_dict(state)
@@ -792,7 +813,7 @@ class FictitiousPlayTrainer:
             opponent_indices = [i for i in range(self.n_agents) if i != mover_idx]
 
             opponent_bids = self._sample_max_belief_bids(opponent_indices)
-            critic = self._new_critic()
+            critic = self._new_critic(mover_idx)
             critic.fit(opponent_bids)
 
             steps_taken = self._best_response(mover_idx, critic)
