@@ -23,6 +23,21 @@ under identical conditions, never escapes initialization-level `MaxDiff`
 (stuck at `~0.44-0.49` after as many rounds, with payoffs swinging wildly
 between -0.2 and +0.2 depending on which agent just moved).
 
+**Caveat found later, important**: this advantage is *not* universal —
+it's tied to the specific algebraic identity `b=c*v^p => b/c ~ Beta(1/p,1)`
+that happens to hold for every auction variant tried above (first-price,
+all-pay, the whole `payment_share` continuum between them). It does **not**
+hold for the heterogeneous-risk-aversion first-price auction added later
+(`risk_aversion` on `FictitiousPlayTrainer`): there, `BetaCritic`'s
+power-law assumption has a genuine ~5-6% CDF misspecification against the
+*true* equilibrium bid distribution (not sampling noise — measured on 500k
+samples drawn directly from the true equilibrium), and training plateaus
+visibly short of the true equilibrium as a result, while `SplineCritic`
+gets much closer under otherwise identical settings. See
+`docs/findings_risk_aversion.md` for the full writeup. Check whether a new
+auction variant's equilibrium is actually power-law-shaped before reaching
+for `critic_type="beta"` by default.
+
 ## Motivation: an exact distributional identity
 
 The symmetric Bayes-Nash equilibrium bid for the `payment_share`-generalized
