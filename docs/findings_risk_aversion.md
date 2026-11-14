@@ -1,9 +1,10 @@
 # Heterogeneous risk aversion in the 2-agent first-price auction
 
-**Status: ground truth derived and verified; training works with SplineCritic,
-but BetaCritic (the project's default improvement for the lambda/all-pay
-continuum) turns out to be the *wrong* choice here — its parametric
-assumption doesn't hold for this auction variant.**
+**Status: ground truth derived and verified; training converges fully with
+SplineCritic (MaxDiff < 0.02 by round 220), but BetaCritic (the project's
+default improvement for the lambda/all-pay continuum) turns out to be the
+*wrong* choice here — its parametric assumption doesn't hold for this
+auction variant and training plateaus short of the true equilibrium.**
 
 ## The theoretical equilibrium has no closed form
 
@@ -71,10 +72,12 @@ methodology as `docs/findings_beta_critic.md`).
   risk-averse one) bid *flattens* around `b=0.53` for `v` above ~0.75,
   instead of climbing to the true `b_bar=0.6236` at `v=1`
   (`checkpoints/checkpoint_risk_averse_beta.pt`).
-- **`SplineCritic`**, identical settings otherwise: `MaxDiff` reaches
-  `~0.024-0.03` by round ~130-140 (still not fully settled below the 0.02
-  threshold in 150 rounds, see below for a longer run), a clearly different
-  and much better regime (`checkpoints/checkpoint_risk_averse_spline.pt`).
+- **`SplineCritic`**, identical settings otherwise: reaches full convergence
+  (`MaxDiff < 0.02` for both agents) at round 220 — resumed for 50 more
+  rounds past the initial 150-round budget, after hovering in the
+  `0.018-0.04` range for a while. A clearly different and much better
+  regime than `BetaCritic`'s stable-but-wrong plateau
+  (`checkpoints/checkpoint_risk_averse_spline.pt`).
 
 **Root cause**: `BetaCritic` fits `P(win|b) = (b/scale)^alpha`, exact *only*
 because the symmetric and lambda-continuum equilibria this project worked
@@ -102,10 +105,6 @@ higher variance.
 
 ## Open items
 
-- The 150-round `SplineCritic` run above hadn't fully settled below
-  `MaxDiff < 0.02` yet (still oscillating in the 0.02-0.07 range at the
-  end) — a longer run should be checked before calling this fully
-  converged.
 - Only tested at one `(rho_1, rho_2)` pair (`0.3, 1.0`); haven't checked
   how the bias/convergence behavior scales as the two `rho`s get closer
   together (where the equilibrium is closer to the symmetric linear case)
