@@ -93,7 +93,7 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
             theoretical_p_win = theoretical_win_probability(b_grid, n_agents, trainer.auction_type).cpu()
 
     plt.figure()
-    plt.plot(b_grid.cpu(), learned_p_win, label="Crítico aprendido (spline)")
+    plt.plot(b_grid.cpu(), learned_p_win, label=f"Crítico aprendido ({trainer.critic_type})")
     plt.plot(b_grid.cpu(), theoretical_p_win, "--", color="black", label="P(vitória|b) teórica")
     plt.xlabel("Lance b")
     plt.ylabel("P(vitória | b)")
