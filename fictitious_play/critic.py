@@ -149,6 +149,129 @@ class BetaCritic:
         return x ** self.alpha
 
 
+class MixtureBetaCritic:
+    """Estimates P(win | b) = P(opponent's bid < b) with a mixture of K
+    scaled Beta(alpha_k, 1) CDFs sharing one scale: F(x) = sum_k pi_k *
+    (x/scale)^alpha_k, pi_k >= 0, sum_k pi_k = 1.
+
+    Monotonic by construction for the same reason BetaCritic is: each
+    component (x/scale)^alpha_k is itself a valid CDF (monotonic
+    non-decreasing, 0 at x=0, 1 at x=scale), and a convex combination (the
+    pi_k's are nonnegative and sum to 1) of valid CDFs is again a valid
+    CDF — no architecture trick needed, just the fact that mixing
+    probability distributions can't un-order them.
+
+    Fitting is still closed-form per iteration, not gradient descent: a
+    Beta(alpha, 1) sample transforms exactly to an Exponential(alpha)
+    sample under Y = -log(X) (CDF of X is x^alpha, so
+    P(-log X > y) = P(X < e^-y) = e^(-alpha*y), i.e. Y ~ Exp(alpha)). So
+    fitting a mixture of Beta(alpha_k, 1)'s on the (scaled) bids is exactly
+    equivalent to fitting a mixture of Exponential(alpha_k)'s on their
+    -log, which has a textbook closed-form EM update (E-step: responsibility
+    of component k; M-step: pi_k and alpha_k are both plain weighted means,
+    no numerical optimizer). A few dozen EM iterations settle it, versus
+    the thousands of Adam steps MonotonicNNCritic needs — and unlike that
+    per-round gradient refit, EM here is deterministic given the data and
+    the warm-started initial guess, so it carries none of the per-round
+    optimization noise that showed up as persistent oscillation in the
+    fictitious-play dynamics with the NN critic (see
+    docs/findings_monotonic_nn_critic.md).
+
+    One shared scale (not one per component) matches BetaCritic: the
+    largest observed bid is the exact deterministic boundary of the
+    opponent's support regardless of how many mixture components describe
+    the shape below it, so there's no reason to estimate it per component.
+
+    Meant to be warm-started round to round like MonotonicNNCritic (fit()
+    reuses the previous call's alpha/pi as the EM's initial guess instead
+    of restarting from scratch), so callers should keep one persistent
+    instance per agent rather than constructing a fresh one every round.
+    """
+
+    def __init__(self, n_components: int = 2, em_iters: int = 50,
+                 device: torch.device | str | None = None,
+                 min_alpha: float = 1e-3, eps: float = 1e-6):
+        self.device = torch.device(device) if device else torch.device("cpu")
+        self.n_components = n_components
+        self.em_iters = em_iters
+        self.min_alpha = min_alpha
+        self.eps = eps
+        self.alpha_np: np.ndarray | None = None
+        self.pi_np: np.ndarray | None = None
+        self.alpha: torch.Tensor | None = None
+        self.pi: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+
+    def state_dict(self) -> dict:
+        return {
+            "alpha_np": self.alpha_np,
+            "pi_np": self.pi_np,
+            "scale": self.scale.item() if self.scale is not None else None,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.alpha_np = state["alpha_np"]
+        self.pi_np = state["pi_np"]
+        if self.alpha_np is not None:
+            # Makes predict_win_prob usable immediately, same as fit() would
+            # (the warm-started EM state in alpha_np/pi_np is what the next
+            # fit() call actually continues from; these torch copies just
+            # mean a restored critic doesn't need that extra fit() call to
+            # be queried first, mirroring MonotonicNNCritic's contract).
+            self.alpha = torch.tensor(self.alpha_np, dtype=torch.float32, device=self.device)
+            self.pi = torch.tensor(self.pi_np, dtype=torch.float32, device=self.device)
+            self.scale = torch.tensor(state["scale"], dtype=torch.float32, device=self.device)
+
+    def fit(self, opponent_bids: np.ndarray) -> None:
+        bids = np.asarray(opponent_bids, dtype=np.float64)
+        scale = float(bids.max())
+        if scale <= 0:
+            scale = self.eps
+
+        # Same care as BetaCritic: only clip the x=0 singularity, not with
+        # self.eps, to avoid biasing alpha_hat (see BetaCritic.fit).
+        x = np.clip(bids / scale, np.finfo(np.float64).tiny, 1.0)
+        y = -np.log(x)  # Beta(alpha_k, 1) on x <=> Exponential(alpha_k) on y
+
+        k = self.n_components
+        if self.alpha_np is None:
+            # Break symmetry on the first call (no warm start yet): spread
+            # initial alphas geometrically around 1 (risk-neutral/first-price).
+            self.alpha_np = np.geomspace(0.3, 3.0, k)
+            self.pi_np = np.full(k, 1.0 / k)
+
+        alpha = self.alpha_np.copy()
+        pi = self.pi_np.copy()
+        for _ in range(self.em_iters):
+            # E-step: responsibilities r[i, k] = P(component k | y_i),
+            # computed in log-space (component density is alpha_k*exp(-alpha_k*y)).
+            log_dens = (np.log(pi) + np.log(alpha))[None, :] - alpha[None, :] * y[:, None]
+            m = log_dens.max(axis=1, keepdims=True)
+            w = np.exp(log_dens - m)
+            resp = w / np.clip(w.sum(axis=1, keepdims=True), 1e-300, None)
+
+            # M-step: both updates are plain weighted means (MLE of an
+            # Exponential given responsibilities has a closed form, just
+            # like the unweighted single-component case in BetaCritic).
+            n_k = resp.sum(axis=0)
+            pi = n_k / len(y)
+            alpha = n_k / np.maximum((resp * y[:, None]).sum(axis=0), 1e-12)
+            alpha = np.clip(alpha, self.min_alpha, None)
+
+        self.alpha_np = alpha
+        self.pi_np = pi
+        self.alpha = torch.tensor(alpha, dtype=torch.float32, device=self.device)
+        self.pi = torch.tensor(pi, dtype=torch.float32, device=self.device)
+        self.scale = torch.tensor(scale, dtype=torch.float32, device=self.device)
+
+    def predict_win_prob(self, bids: torch.Tensor) -> torch.Tensor:
+        if self.alpha is None:
+            raise RuntimeError("MixtureBetaCritic must be fit before calling predict_win_prob.")
+        x = (bids / self.scale).clamp(self.eps, 1.0)
+        component_cdfs = x.unsqueeze(-1) ** self.alpha
+        return (component_cdfs * self.pi).sum(-1)
+
+
 class MonotonicNNCritic:
     """Estimates P(win | b) = P(opponent's bid < b) with a small neural
     network constrained to be monotonically non-decreasing in b *by

@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
-from fictitious_play.critic import BetaCritic, MonotonicNNCritic, SplineCritic
+from fictitious_play.critic import BetaCritic, MixtureBetaCritic, MonotonicNNCritic, SplineCritic
 
 
 def test_cdf_matches_uniform_distribution():
@@ -133,6 +133,114 @@ def test_beta_critic_handles_degenerate_zero_bids():
     query = torch.tensor([0.0, 0.5, 1.0])
     predicted = critic.predict_win_prob(query)
     assert torch.all(torch.isfinite(predicted))
+
+
+def test_mixture_beta_critic_matches_uniform_distribution():
+    rng = np.random.default_rng(0)
+    bids = rng.uniform(0.0, 0.5, size=300_000)
+
+    critic = MixtureBetaCritic()
+    critic.fit(bids)
+
+    query = torch.tensor([0.0, 0.1, 0.25, 0.4, 0.5])
+    predicted = critic.predict_win_prob(query)
+    expected = torch.tensor([0.0, 0.2, 0.5, 0.8, 1.0])
+    assert torch.allclose(predicted, expected, atol=0.02)
+
+
+def test_mixture_beta_critic_is_monotonic():
+    """Checked over several random initial guesses (not just one fit): a
+    mixture of valid CDFs with nonnegative weights summing to 1 is monotonic
+    regardless of the particular alpha_k/pi_k values, since mixing
+    probability distributions can't un-order them (see the class
+    docstring) — this isn't something fit() needs to achieve, it holds for
+    any alpha_k > 0."""
+    rng = np.random.default_rng(1)
+    query = torch.linspace(0.0, 1.0, 200)
+    for trial in range(5):
+        critic = MixtureBetaCritic()
+        critic.alpha_np = rng.uniform(0.1, 5.0, size=2)
+        critic.pi_np = np.array([0.3, 0.7])
+        critic.alpha = torch.tensor(critic.alpha_np, dtype=torch.float32)
+        critic.pi = torch.tensor(critic.pi_np, dtype=torch.float32)
+        critic.scale = torch.tensor(1.0)
+
+        predicted = critic.predict_win_prob(query)
+        diffs = predicted[1:] - predicted[:-1]
+        assert torch.all(diffs >= -1e-6)
+
+
+def test_mixture_beta_critic_gradient_flows_through_bid():
+    rng = np.random.default_rng(2)
+    bids = rng.uniform(0.0, 0.5, size=50_000)
+
+    critic = MixtureBetaCritic()
+    critic.fit(bids)
+
+    b = torch.tensor([0.3], requires_grad=True)
+    p_win = critic.predict_win_prob(b)
+    p_win.backward()
+
+    assert b.grad is not None
+    assert b.grad.item() > 0
+
+
+def test_mixture_beta_critic_warm_start_adapts_to_shifted_distribution():
+    """fit() reuses the previous call's alpha/pi as the EM's initial guess
+    (see the class docstring) — check a second fit() on a different (wider)
+    distribution actually moves the prediction."""
+    rng = np.random.default_rng(3)
+    critic = MixtureBetaCritic(em_iters=50)
+    critic.fit(rng.uniform(0.0, 0.3, size=20_000))
+    first = critic.predict_win_prob(torch.tensor([0.5])).item()
+
+    critic.fit(rng.uniform(0.0, 0.8, size=20_000))
+    second = critic.predict_win_prob(torch.tensor([0.5])).item()
+
+    assert first > 0.9  # 0.5 is well past the first (narrower) distribution's range
+    assert second < 0.8  # ...but well inside the second (wider) one's range
+    assert abs(second - 0.625) < 0.1  # true CDF value at 0.5 under Uniform(0, 0.8)
+
+
+def test_mixture_beta_critic_state_dict_round_trip():
+    rng = np.random.default_rng(4)
+    bids = rng.uniform(0.0, 0.5, size=10_000)
+
+    critic = MixtureBetaCritic(em_iters=20)
+    critic.fit(bids)
+    query = torch.linspace(0.0, 1.0, 20)
+    before = critic.predict_win_prob(query)
+
+    state = critic.state_dict()
+    restored = MixtureBetaCritic(em_iters=20)
+    restored.load_state_dict(state)
+    after = restored.predict_win_prob(query)
+
+    assert torch.allclose(before, after)
+
+
+def test_mixture_beta_critic_fits_bimodal_shape_better_than_single_beta():
+    """The whole point of mixing K>1 components: a shape that isn't a
+    single power law (e.g. two distinct sub-populations of opponent bids)
+    should be fit measurably better by the mixture than by BetaCritic's
+    single component."""
+    rng = np.random.default_rng(5)
+    low = rng.uniform(0.0, 0.2, size=25_000)
+    high = rng.uniform(0.6, 1.0, size=25_000)
+    bids = np.concatenate([low, high])
+
+    query = torch.linspace(0.0, 1.0, 300)
+    empirical = torch.tensor(np.searchsorted(np.sort(bids), query.numpy()) / len(bids))
+
+    single = BetaCritic()
+    single.fit(bids)
+    single_err = (single.predict_win_prob(query) - empirical).abs().max().item()
+
+    mixture = MixtureBetaCritic()
+    mixture.fit(bids)
+    mixture_err = (mixture.predict_win_prob(query) - empirical).abs().max().item()
+
+    assert mixture_err < single_err
 
 
 def test_monotonic_nn_critic_matches_uniform_distribution():
