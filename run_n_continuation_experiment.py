@@ -65,12 +65,20 @@ def main():
         trainer.load_checkpoint()
         print(f"Retomado de {checkpoint_path}: rodada {len(trainer.history)}, "
               f"n_agents={trainer.n_agents}, payment_share={trainer.payment_share:.2f}")
+        stage_start = trainer.growth_rounds[-1] if trainer.growth_rounds else 0
+        elapsed_in_stage = len(trainer.history) - stage_start
         if trainer.n_agents == start_n and trainer.payment_share in args.lambdas:
             lambda_start_idx = args.lambdas.index(trainer.payment_share) + 1
-            trainer.run()
+            nominal = args.rounds_per_lambda_stage
         else:
             lambda_start_idx = len(args.lambdas)  # lambda ramp already finished
             n_start_idx = args.n_agents_schedule.index(trainer.n_agents) + 1
+            nominal = args.rounds_per_n_stage
+        remaining = nominal - elapsed_in_stage
+        print(f"{elapsed_in_stage} rodadas ja neste estagio (orcamento {nominal}), "
+              f"faltam {max(remaining, 0)}")
+        if remaining > 0:
+            trainer.n_rounds = remaining
             trainer.run()
 
     trainer.n_rounds = args.rounds_per_lambda_stage

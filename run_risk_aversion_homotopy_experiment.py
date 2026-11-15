@@ -81,9 +81,17 @@ def main():
                               f"--rho0-schedule/--rho1-schedule — can't tell which stage to "
                               f"resume from. Pass the same schedule used to produce it.")
         start_stage_idx = matches[0]
+        stage_start = trainer.growth_rounds[-1] if trainer.growth_rounds else 0
+        elapsed_in_stage = len(trainer.history) - stage_start
+        remaining = args.rounds_per_stage - elapsed_in_stage
         print(f"Retomado de {checkpoint_path}: rodada {len(trainer.history)}, "
-              f"estagio {start_stage_idx} (risk_aversion={restored_rho})")
-        trainer.run()
+              f"estagio {start_stage_idx} (risk_aversion={restored_rho}), "
+              f"{elapsed_in_stage} rodadas ja neste estagio (orcamento {args.rounds_per_stage}), "
+              f"faltam {max(remaining, 0)}")
+        if remaining > 0:
+            trainer.n_rounds = remaining
+            trainer.run()
+        trainer.n_rounds = args.rounds_per_stage
         start_stage_idx += 1
 
     for stage_idx in range(start_stage_idx, len(schedule)):
