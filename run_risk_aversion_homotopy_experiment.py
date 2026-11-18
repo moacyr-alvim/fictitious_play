@@ -32,7 +32,7 @@ def parse_args():
                               "than the plain run_experiment.py default (0.9) — longer memory "
                               "damps the best-response cycling a persistently warm-started "
                               "critic (critic-type nn) is prone to (see "
-                              "docs/findings_monotonic_nn_critic.md).")
+                              "docs/findings_mixture_beta_critic.md).")
     parser.add_argument("--max-diff-threshold", type=float, default=0.02)
     parser.add_argument("--payoff-rel-tol", type=float, default=-1.0,
                          help="No single theoretical payoff applies under risk_aversion (see "

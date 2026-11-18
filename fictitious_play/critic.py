@@ -175,7 +175,7 @@ class MixtureBetaCritic:
     the warm-started initial guess, so it carries none of the per-round
     optimization noise that showed up as persistent oscillation in the
     fictitious-play dynamics with the NN critic (see
-    docs/findings_monotonic_nn_critic.md).
+    docs/findings_mixture_beta_critic.md).
 
     One shared scale (not one per component) matches BetaCritic: the
     largest observed bid is the exact deterministic boundary of the
