@@ -189,7 +189,15 @@ escolhendo um crítico com a forma certa.)
    Resultado: all-pay para de ciclar e converge limpo — testado e
    confirmado em N=2 (convergência em 55 rounds) **e em N=5** (convergência
    estável, payoffs batendo com o teórico, **sem** nenhum buffer reforçado,
-   regularização ou continuação) (`docs/findings_beta_critic.md`).
+   regularização ou continuação) (`docs/findings_beta_critic.md`):
+
+   | Lance aprendido vs. teórico (N=5) | Convergência do erro (escala log) |
+   |---|---|
+   | ![bid function N=5 all-pay beta](images/allpay_n5_beta_bid_function.png) | ![convergência N=5 all-pay beta](images/allpay_n5_beta_convergence.png) |
+
+   As 5 curvas aprendidas ficam praticamente coladas na teórica, e o erro
+   cai de forma limpa e monotônica — sem nenhuma das firulas das seções
+   seguintes.
 
 4. **Aversão a risco expõe o limite do `BetaCritic`**: aqui o equilíbrio
    não é lei de potência (e nem tem fórmula fechada — precisou de um
@@ -224,6 +232,16 @@ escolhendo um crítico com a forma certa.)
    resíduo quantitativo de ~25-30% contra a curva teórica no topo, não
    fechado nem com 400 rounds por estágio de crescimento. (A aversão a
    risco ainda não foi re-testada com orçamento maior — item em aberto.)
+
+   | Lance aprendido vs. teórico (N=4, após homotopia refinada) | Convergência do erro (escala log) |
+   |---|---|
+   | ![bid function N=4 all-pay mistura refinada](images/allpay_n4_mixture_refined_bid_function.png) | ![convergência N=4 all-pay mistura refinada](images/allpay_n4_mixture_refined_convergence.png) |
+
+   Compare com o item 3: os 4 agentes já convergem entre si de forma
+   simétrica e suave (nada dos "degraus"/cliffs da tentativa anterior com
+   orçamento curto), mas ainda sobra aquele gap de ~25-30% no topo — a
+   maquinaria de continuação chegou mais perto do equilíbrio, mas não
+   fechou de vez.
 
 ## 6. Onde estamos agora
 
