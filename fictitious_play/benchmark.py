@@ -240,3 +240,59 @@ def theoretical_win_probability_risk_averse(b: torch.Tensor, agent_idx: int,
     b_np = b.detach().cpu().numpy()
     p_np = eq.phi[opponent_idx](b_np)
     return torch.tensor(p_np, dtype=b.dtype, device=b.device).reshape(b.shape)
+
+
+def common_value_interior_range(noise: float, margin_multiples: float = 3.0) -> tuple[float, float]:
+    """(lo, hi) for the true value V such that every signal S_i = V + eps_i
+    (eps_i ~ Uniform(-noise, noise)) and every other signal within 2*noise of
+    it stays strictly inside (0, 1) — the region equilibrium_bid_common_value
+    and common_value_posterior_mean are exact in (see their docstrings for
+    why the formulas break down outside it). margin_multiples=3 gives one
+    full noise-width of slack beyond the 2*noise a single signal's own
+    posterior needs, so a second signal within the first's support stays
+    interior too."""
+    margin = margin_multiples * noise
+    return margin, 1.0 - margin
+
+
+def equilibrium_bid_common_value(signal: torch.Tensor, noise: float) -> torch.Tensor:
+    """Symmetric Bayes-Nash equilibrium bid for the N=2 first-price
+    common-value auction: a true value V ~ Uniform(0, 1) shared by both
+    bidders, each observing a private signal S_i = V + eps_i with
+    eps_i ~ i.i.d. Uniform(-noise, noise) (the classic "mineral rights"/
+    wallet-game model). Exact only in the interior region
+    common_value_interior_range(noise) — derived assuming every signal's
+    own Bayesian posterior for V is a non-truncated Uniform(S_i-noise,
+    S_i+noise), which requires S_i to be at least `noise` away from both
+    0 and 1.
+
+    Derivation (linear-equilibrium ansatz b(x) = x - k, verified as a
+    mutual best response in tests/test_benchmark.py): with V | S_1=x ~
+    Uniform(x-noise, x+noise) and S_2 | S_1=x then a Triangular(center=x,
+    half-width=2*noise) distribution (the convolution of two independent
+    Uniform(-noise, noise) noises), the first-order condition at the
+    symmetric equilibrium reduces to k = F(x|x)/f(x|x) where F, f are
+    that triangular distribution's CDF/density evaluated at its own
+    center — F(x|x)=1/2, f(x|x)=1/(2*noise) for *any* symmetric
+    continuous noise distribution, giving the noise-shape-independent
+    result k = noise exactly (not noise/(N-1) or any other N-dependent
+    quantity — this is the N=2 case specifically; the N>=3 generalization
+    needs the actual order-statistic distribution of the max of N-1
+    triangular draws, not just a single one, and is *not* yet derived
+    correctly here — see docs/findings_common_value.md).
+    """
+    return signal - noise
+
+
+def common_value_posterior_mean(own_signal: torch.Tensor, other_signal: torch.Tensor,
+                                 noise: float) -> torch.Tensor:
+    """E[V | S_1=own_signal, S_2=other_signal] for the model in
+    equilibrium_bid_common_value: both signals' Uniform(S_i-noise,
+    S_i+noise) posteriors for V must hold simultaneously, so V's joint
+    posterior is Uniform over their overlap
+    (max(own,other)-noise, min(own,other)+noise), whose midpoint is simply
+    (own_signal + other_signal) / 2 — exact for any other_signal within
+    2*noise of own_signal (i.e. anywhere the two Uniform(.-noise,.+noise)
+    posteriors actually overlap), not just at other_signal == own_signal.
+    """
+    return (own_signal + other_signal) / 2.0

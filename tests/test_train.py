@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from fictitious_play.benchmark import equilibrium_bid_lambda, equilibrium_bid_risk_averse
+from fictitious_play.benchmark import (
+    common_value_interior_range,
+    equilibrium_bid_common_value,
+    equilibrium_bid_lambda,
+    equilibrium_bid_risk_averse,
+)
 from fictitious_play.critic import (
     BetaCritic,
     KumaraswamyCritic,
@@ -355,3 +360,58 @@ def test_set_risk_aversion_requires_risk_aversion_already_set():
     trainer = FictitiousPlayTrainer(n_agents=2, sample_size=100, seed=0)
     with pytest.raises(ValueError):
         trainer.set_risk_aversion([0.5, 1.0])
+
+
+def test_common_value_rejects_n_agents_other_than_two():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=3, common_value_noise=0.1)
+
+
+def test_common_value_rejects_non_first_price():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, auction_type="all_pay", common_value_noise=0.1)
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, payment_share=0.5, common_value_noise=0.1)
+
+
+def test_common_value_rejects_risk_aversion_combo():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, risk_aversion=[0.5, 1.0], common_value_noise=0.1)
+
+
+def test_common_value_rejects_pinn_weight():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1, pinn_weight=0.1)
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1, pinn_opponent_weight=0.1)
+
+
+def test_common_value_eval_grid_restricted_to_interior_region():
+    noise = 0.1
+    trainer = FictitiousPlayTrainer(n_agents=2, common_value_noise=noise, sample_size=100, seed=0)
+    lo, hi = common_value_interior_range(noise)
+    assert trainer.eval_grid.min().item() == pytest.approx(lo)
+    assert trainer.eval_grid.max().item() == pytest.approx(hi)
+
+
+def test_common_value_benchmark_metrics_use_common_value_target():
+    trainer = FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1, sample_size=100, seed=0)
+
+    class _ZeroActor:
+        def __call__(self, v):
+            return torch.zeros_like(v)
+
+    trainer.agents = [_ZeroActor(), _ZeroActor()]
+    _, max_diff = trainer._benchmark_metrics(0)
+    target = equilibrium_bid_common_value(trainer.eval_grid, 0.1)
+    assert max_diff == pytest.approx(target.max().item(), abs=1e-4)
+
+
+def test_common_value_trains_without_error_with_kumaraswamy_critic():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        common_value_noise=0.1, critic_type="kumaraswamy",
+        max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 3

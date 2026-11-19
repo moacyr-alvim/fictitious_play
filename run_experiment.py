@@ -70,6 +70,16 @@ def parse_args():
                               "first_price), and incompatible with --pinn-weight/"
                               "--pinn-opponent-weight > 0 — see "
                               "fictitious_play.benchmark.equilibrium_bid_risk_averse.")
+    parser.add_argument("--common-value-noise", type=float, default=None,
+                         metavar="NOISE",
+                         help="N=2 first-price common-value auction: a shared true value "
+                              "V~Uniform(0,1), each agent observing only a private signal "
+                              "S_i=V+eps_i with eps_i~Uniform(-NOISE,NOISE) (the 'mineral "
+                              "rights'/wallet-game model). Only n_agents=2, first-price, "
+                              "incompatible with --risk-aversion and --pinn-weight/"
+                              "--pinn-opponent-weight > 0 (supplies its own FOC-based value "
+                              "correction instead) — see "
+                              "fictitious_play.benchmark.equilibrium_bid_common_value.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -96,6 +106,7 @@ def main():
         auction_type=args.auction_type, payoff_weight=args.payoff_weight,
         pinn_weight=args.pinn_weight, pinn_opponent_weight=args.pinn_opponent_weight,
         opponent_ema_decay=args.opponent_ema_decay, risk_aversion=args.risk_aversion,
+        common_value_noise=args.common_value_noise,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

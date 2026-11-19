@@ -3,7 +3,10 @@ import torch
 from scipy.optimize import minimize_scalar
 
 from fictitious_play.benchmark import (
+    common_value_interior_range,
+    common_value_posterior_mean,
     equilibrium_bid_all_pay,
+    equilibrium_bid_common_value,
     equilibrium_bid_first_price,
     equilibrium_bid_lambda,
     equilibrium_bid_risk_averse,
@@ -116,3 +119,42 @@ def test_risk_averse_more_averse_agent_bids_more_aggressively():
     b_more_averse = equilibrium_bid_risk_averse(v, 0, (0.3, 0.8))
     b_less_averse = equilibrium_bid_risk_averse(v, 1, (0.3, 0.8))
     assert torch.all(b_more_averse / v > b_less_averse / v)
+
+
+def test_common_value_posterior_mean_reduces_to_own_signal_on_diagonal():
+    """E[V | S_1=x, S_2=x] = x: if both bidders received exactly the same
+    signal, that shared signal is itself the best estimate of V (no reason
+    to shade either direction)."""
+    x = torch.linspace(0.2, 0.8, 7)
+    assert torch.allclose(common_value_posterior_mean(x, x, noise=0.1), x)
+
+
+def test_common_value_equilibrium_is_mutual_best_response():
+    """Core correctness check for the N=2 linear common-value equilibrium
+    (see equilibrium_bid_common_value's docstring): Monte Carlo the actual
+    expected payoff of deviating to a candidate bid, with the opponent
+    playing the solved equilibrium bid - noise, and check the maximizer
+    matches the solved bid itself, in the interior signal region."""
+    noise = 0.1
+    lo, hi = common_value_interior_range(noise)
+    rng = np.random.default_rng(0)
+    n_mc = 2_000_000
+
+    for x in np.linspace(lo + 0.05, hi - 0.05, 6):
+        b_pred = equilibrium_bid_common_value(torch.tensor([x]), noise).item()
+
+        # Common random numbers: one (v, s2) sample reused for every
+        # candidate beta, so the Monte Carlo objective is smooth enough for
+        # minimize_scalar instead of being swamped by resampling noise.
+        v = rng.uniform(x - noise, x + noise, size=n_mc)
+        s2 = rng.uniform(v - noise, v + noise)
+
+        def neg_expected_payoff(beta, v=v, s2=s2):
+            win = s2 < (beta + noise)  # opponent bids s2-noise < beta <=> s2 < beta+noise
+            return -((v - beta) * win).mean()
+
+        res = minimize_scalar(neg_expected_payoff, bounds=(0.0, x),
+                               method="bounded", options={"xatol": 1e-4})
+        assert abs(res.x - b_pred) < 0.01, (
+            f"noise={noise}, x={x}: best response {res.x} != solved bid {b_pred}"
+        )
