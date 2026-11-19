@@ -162,6 +162,34 @@ def test_opponent_inverse_and_slope_bounded_past_opponents_range():
     assert phi_prime.item() == 0.0
 
 
+def test_opponent_inverse_and_slope_respects_restricted_domain():
+    """common_value_noise trains every agent only on an interior signal
+    region, not the full [0, 1] — opponent_inverse_and_slope must search
+    (and saturate out-of-range values) within that same region, not [0,1],
+    since the opponent actor was never trained outside it (see the
+    docstring's domain_lo/domain_hi explanation)."""
+    def opponent_actor(v):
+        return v - 0.1  # mimics equilibrium_bid_common_value(v, noise=0.1)
+
+    domain_lo, domain_hi = 0.3, 0.7  # common_value_interior_range(0.1)
+
+    # Inside the restricted domain: inverts correctly.
+    b = torch.tensor([[0.25]], requires_grad=True)  # opponent_actor(0.35) = 0.25
+    phi_val, phi_prime = opponent_inverse_and_slope(opponent_actor, b,
+                                                     domain_lo=domain_lo, domain_hi=domain_hi)
+    assert phi_val.item() == pytest.approx(0.35, abs=1e-3)
+    assert phi_prime.item() == pytest.approx(1.0, abs=1e-3)
+
+    # Past the opponent's achievable range *within the restricted domain*
+    # (opponent_actor(0.7) = 0.6): saturates at domain_hi, not at 1.0.
+    b_past = torch.tensor([[0.65]], requires_grad=True)
+    phi_val_past, phi_prime_past = opponent_inverse_and_slope(
+        opponent_actor, b_past, domain_lo=domain_lo, domain_hi=domain_hi
+    )
+    assert phi_val_past.item() == pytest.approx(domain_hi)
+    assert phi_prime_past.item() == 0.0
+
+
 def test_opponent_ema_decay_schedule_interpolates_with_payment_share():
     trainer = FictitiousPlayTrainer(
         n_agents=2, pinn_opponent_weight=1.0, payment_share=0.0,

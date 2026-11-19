@@ -46,13 +46,17 @@ def foc_residual(p_win: torch.Tensor, b: torch.Tensor, v: torch.Tensor, lam: flo
     return dp_db * (v - (1 - lam) * b) - (1 - lam) * p_win - lam
 
 
-def _invert_monotonic(actor, target: torch.Tensor, iters: int = 30) -> torch.Tensor:
-    """Bisection search (batched, no grad) for v in [0, 1] with actor(v) ≈
-    target, assuming actor(v) is non-decreasing in v (true at/near a best
-    response, though not guaranteed mid-training — see
-    foc_residual_opponent)."""
-    lo = torch.zeros_like(target)
-    hi = torch.ones_like(target)
+def _invert_monotonic(actor, target: torch.Tensor, iters: int = 30,
+                       domain_lo: float = 0.0, domain_hi: float = 1.0) -> torch.Tensor:
+    """Bisection search (batched, no grad) for v in [domain_lo, domain_hi]
+    with actor(v) ≈ target, assuming actor(v) is non-decreasing in v (true
+    at/near a best response, though not guaranteed mid-training — see
+    foc_residual_opponent). domain_lo/domain_hi default to the full [0, 1]
+    (every agent in this project trains on the full unit interval except
+    under common_value_noise, which restricts both training and this
+    search to its interior signal region — see opponent_inverse_and_slope)."""
+    lo = torch.full_like(target, domain_lo)
+    hi = torch.full_like(target, domain_hi)
     with torch.no_grad():
         for _ in range(iters):
             mid = (lo + hi) / 2
@@ -62,7 +66,9 @@ def _invert_monotonic(actor, target: torch.Tensor, iters: int = 30) -> torch.Ten
     return (lo + hi) / 2
 
 
-def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def opponent_inverse_and_slope(
+    opponent_actor, b: torch.Tensor, domain_lo: float = 0.0, domain_hi: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (phi(b), phi'(b)) where phi = opponent_actor^-1, treating
     the opponent's parameters as fixed (this is called from the mover's
     best-response step, where only the mover's own parameters should get
@@ -73,22 +79,31 @@ def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.T
     known local slope 1/opponent_actor'(v*) carries the dependency on b.
 
     b is clamped to the opponent's actually achievable range
-    [opponent_actor(0), opponent_actor(1)] before inverting: bidding
-    beyond that range wins for certain (phi=1) with no further marginal
-    effect (phi'=0), and extrapolating the bisection past the opponent's
-    real range instead (which a naive implementation would do, since
-    bisection just saturates its search interval) can return an near-flat
-    point of opponent_actor whose slope is tiny, making 1/slope blow up —
-    empirically this drove exactly this kind of runaway: a mover bidding
-    just past the opponent's current max got an exploding phi', escalated
-    further next step, and saturated at b(v)=v."""
+    [opponent_actor(domain_lo), opponent_actor(domain_hi)] before
+    inverting: bidding beyond that range wins for certain (phi=domain_hi)
+    with no further marginal effect (phi'=0), and extrapolating the
+    bisection past the opponent's real range instead (which a naive
+    implementation would do, since bisection just saturates its search
+    interval) can return an near-flat point of opponent_actor whose slope
+    is tiny, making 1/slope blow up — empirically this drove exactly this
+    kind of runaway: a mover bidding just past the opponent's current max
+    got an exploding phi', escalated further next step, and saturated at
+    b(v)=v.
+
+    domain_lo/domain_hi must match whatever range the opponent's actor was
+    actually *trained* on (default [0, 1], the common case) — probing it
+    outside that range (its behavior there is untrained, not meaningful)
+    is exactly what happens if these are left at their defaults under
+    common_value_noise, whose agents only ever train on the interior
+    region: pass common_value_interior_range(noise) in that case instead."""
     b_detached = b.detach()
-    lo_b = opponent_actor(torch.zeros_like(b_detached))
-    hi_b = opponent_actor(torch.ones_like(b_detached))
+    lo_b = opponent_actor(torch.full_like(b_detached, domain_lo))
+    hi_b = opponent_actor(torch.full_like(b_detached, domain_hi))
     in_range = (b_detached >= lo_b) & (b_detached <= hi_b)
     b_clamped = torch.clamp(b_detached, min=lo_b, max=hi_b)
 
-    v_star = _invert_monotonic(opponent_actor, b_clamped).requires_grad_(True)
+    v_star = _invert_monotonic(opponent_actor, b_clamped,
+                                domain_lo=domain_lo, domain_hi=domain_hi).requires_grad_(True)
     b_at_v_star = opponent_actor(v_star)
     opponent_slope = torch.autograd.grad(b_at_v_star.sum(), v_star)[0]
     phi_prime_in_range = 1.0 / opponent_slope.clamp(min=1e-6)
@@ -96,8 +111,8 @@ def opponent_inverse_and_slope(opponent_actor, b: torch.Tensor) -> tuple[torch.T
 
     phi_val_in_range = v_star.detach()
     phi_val_at_b_detached = torch.where(
-        b_detached > hi_b, torch.ones_like(b_detached),
-        torch.where(b_detached < lo_b, torch.zeros_like(b_detached), phi_val_in_range),
+        b_detached > hi_b, torch.full_like(b_detached, domain_hi),
+        torch.where(b_detached < lo_b, torch.full_like(b_detached, domain_lo), phi_val_in_range),
     )
     phi_val = phi_val_at_b_detached + phi_prime * (b - b_detached)
     return phi_val, phi_prime
@@ -718,8 +733,10 @@ class FictitiousPlayTrainer:
                         # signal at the bid *this* actor is considering)
                         # isn't something a marginal P(win|b) fit captures.
                         opponent_idx = next(i for i in range(self.n_agents) if i != mover_idx)
+                        domain_lo, domain_hi = common_value_interior_range(self.common_value_noise)
                         opponent_signal, _ = opponent_inverse_and_slope(
-                            self.ema_agents[opponent_idx], b
+                            self.ema_agents[opponent_idx], b,
+                            domain_lo=domain_lo, domain_hi=domain_hi,
                         )
                         v_common = (v + opponent_signal) / 2.0
                         payoff_loss = -(p_win * (v_common - b)).mean()
