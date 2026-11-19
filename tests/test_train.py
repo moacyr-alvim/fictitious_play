@@ -2,7 +2,13 @@ import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda, equilibrium_bid_risk_averse
-from fictitious_play.critic import BetaCritic, MixtureBetaCritic, MonotonicNNCritic, SplineCritic
+from fictitious_play.critic import (
+    BetaCritic,
+    KumaraswamyCritic,
+    MixtureBetaCritic,
+    MonotonicNNCritic,
+    SplineCritic,
+)
 from fictitious_play.train import (
     FictitiousPlayTrainer,
     foc_residual,
@@ -247,6 +253,27 @@ def test_add_agents_extends_mixture_critics():
     trainer.add_agents(2, copy_from=0)
     assert len(trainer.mixture_critics) == 4
     assert all(isinstance(c, MixtureBetaCritic) for c in trainer.mixture_critics)
+
+
+def test_critic_type_kumaraswamy_wires_persistent_critic():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        critic_type="kumaraswamy", max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    critic = trainer.critic_for(0)
+    assert isinstance(critic, KumaraswamyCritic)
+    assert critic is trainer.kumaraswamy_critics[0]
+    assert trainer.critic_for(0) is critic
+
+    history = trainer.run(verbose=False)
+    assert len(history) == 3
+
+
+def test_add_agents_extends_kumaraswamy_critics():
+    trainer = FictitiousPlayTrainer(n_agents=2, critic_type="kumaraswamy", sample_size=100, seed=0)
+    trainer.add_agents(2, copy_from=0)
+    assert len(trainer.kumaraswamy_critics) == 4
+    assert all(isinstance(c, KumaraswamyCritic) for c in trainer.kumaraswamy_critics)
 
 
 def test_risk_aversion_rejects_n_agents_other_than_two():

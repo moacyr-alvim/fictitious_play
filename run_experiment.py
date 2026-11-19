@@ -30,7 +30,7 @@ def parse_args():
                          help="Number of quantile points the spline critic is fit on. "
                               "Ignored if --critic-type beta.")
     parser.add_argument("--critic-type", type=str, default="spline",
-                         choices=["spline", "beta", "nn", "beta_mixture"],
+                         choices=["spline", "beta", "nn", "beta_mixture", "kumaraswamy"],
                          help="spline: monotone cubic Hermite spline over empirical quantiles "
                               "(fictitious_play.critic.SplineCritic). beta: fit a scaled "
                               "Beta(alpha, 1) distribution (2 parameters) instead — exact at "

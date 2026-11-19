@@ -13,9 +13,9 @@ from .benchmark import (
     theoretical_expected_payoff,
     theoretical_win_probability_risk_averse,
 )
-from .critic import BetaCritic, MixtureBetaCritic, MonotonicNNCritic, SplineCritic
+from .critic import BetaCritic, KumaraswamyCritic, MixtureBetaCritic, MonotonicNNCritic, SplineCritic
 
-CRITIC_TYPES = ("spline", "beta", "nn", "beta_mixture")
+CRITIC_TYPES = ("spline", "beta", "nn", "beta_mixture", "kumaraswamy")
 
 
 def crra_utility(x: torch.Tensor, rho: float, eps: float = 1e-6) -> torch.Tensor:
@@ -308,6 +308,8 @@ class FictitiousPlayTrainer:
         # Same idea, for critic_type="beta_mixture" (see MixtureBetaCritic's
         # docstring): persistent so its EM fit warm-starts round to round.
         self.mixture_critics = [MixtureBetaCritic(device=self.device) for _ in range(n_agents)]
+        # Same idea, for critic_type="kumaraswamy".
+        self.kumaraswamy_critics = [KumaraswamyCritic(device=self.device) for _ in range(n_agents)]
         self.history: list[dict] = []
         self.growth_rounds: list[int] = []
         self._frozen_since_round: int | None = None
@@ -416,6 +418,7 @@ class FictitiousPlayTrainer:
 
             self.nn_critics.append(MonotonicNNCritic(device=self.device))
             self.mixture_critics.append(MixtureBetaCritic(device=self.device))
+            self.kumaraswamy_critics.append(KumaraswamyCritic(device=self.device))
 
         self.n_agents += additional_agents
         self.belief_buffers = [self._fresh_bids(i) for i in range(self.n_agents)]
@@ -588,7 +591,7 @@ class FictitiousPlayTrainer:
 
     def _new_critic(
         self, mover_idx: int
-    ) -> SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic:
+    ) -> SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic | KumaraswamyCritic:
         if self.critic_type == "beta":
             return BetaCritic(device=self.device)
         if self.critic_type == "nn":
@@ -599,11 +602,18 @@ class FictitiousPlayTrainer:
             # Persistent, warm-started across rounds (see
             # MixtureBetaCritic's docstring) rather than a fresh instance.
             return self.mixture_critics[mover_idx]
+        if self.critic_type == "kumaraswamy":
+            # Not actually warm-started (each fit() is a self-contained
+            # 1-D search from scratch, see KumaraswamyCritic's docstring),
+            # but kept as a persistent per-agent instance anyway for the
+            # same reason nn_critics/mixture_critics are: uniform
+            # checkpointing/plotting access via critic_for().
+            return self.kumaraswamy_critics[mover_idx]
         return SplineCritic(n_quantiles=self.critic_n_quantiles, device=self.device)
 
     def critic_for(
         self, mover_idx: int
-    ) -> SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic:
+    ) -> SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic | KumaraswamyCritic:
         """Fits (without training the *actor*) the critic mover_idx
         currently faces, i.e. the smoothed CDF of the max bid drawn from
         the other agents' belief buffers."""
@@ -615,7 +625,7 @@ class FictitiousPlayTrainer:
 
     def _best_response(
         self, mover_idx: int,
-        critic: SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic
+        critic: SplineCritic | BetaCritic | MonotonicNNCritic | MixtureBetaCritic | KumaraswamyCritic
     ) -> int:
         actor = self.agents[mover_idx]
         optimizer = self.optimizers[mover_idx]
@@ -778,6 +788,7 @@ class FictitiousPlayTrainer:
             "ema_agents": [a.state_dict() for a in self.ema_agents],
             "nn_critics": [c.state_dict() for c in self.nn_critics],
             "mixture_critics": [c.state_dict() for c in self.mixture_critics],
+            "kumaraswamy_critics": [c.state_dict() for c in self.kumaraswamy_critics],
             "optimizers": [o.state_dict() for o in self.optimizers],
             "belief_buffers": self.belief_buffers,
             "history": self.history,
@@ -827,6 +838,11 @@ class FictitiousPlayTrainer:
         self.mixture_critics = [MixtureBetaCritic(device=self.device) for _ in self.agents]
         if "mixture_critics" in checkpoint:
             for critic, state in zip(self.mixture_critics, checkpoint["mixture_critics"]):
+                critic.load_state_dict(state)
+
+        self.kumaraswamy_critics = [KumaraswamyCritic(device=self.device) for _ in self.agents]
+        if "kumaraswamy_critics" in checkpoint:
+            for critic, state in zip(self.kumaraswamy_critics, checkpoint["kumaraswamy_critics"]):
                 critic.load_state_dict(state)
 
         self.optimizers = [torch.optim.Adam(a.parameters(), lr=self.lr) for a in self.agents]

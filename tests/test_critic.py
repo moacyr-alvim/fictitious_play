@@ -3,7 +3,13 @@ import pytest
 import torch
 
 from fictitious_play.benchmark import equilibrium_bid_lambda
-from fictitious_play.critic import BetaCritic, MixtureBetaCritic, MonotonicNNCritic, SplineCritic
+from fictitious_play.critic import (
+    BetaCritic,
+    KumaraswamyCritic,
+    MixtureBetaCritic,
+    MonotonicNNCritic,
+    SplineCritic,
+)
 
 
 def test_cdf_matches_uniform_distribution():
@@ -241,6 +247,117 @@ def test_mixture_beta_critic_fits_bimodal_shape_better_than_single_beta():
     mixture_err = (mixture.predict_win_prob(query) - empirical).abs().max().item()
 
     assert mixture_err < single_err
+
+
+def test_kumaraswamy_critic_matches_uniform_distribution():
+    """Kumaraswamy(1, 1) is exactly Uniform (F(x)=1-(1-x)=x), so a fit on
+    Uniform[0, 0.5] bids should recover a~1, b~1 and reproduce the linear
+    CDF."""
+    rng = np.random.default_rng(0)
+    bids = rng.uniform(0.0, 0.5, size=300_000)
+
+    critic = KumaraswamyCritic()
+    critic.fit(bids)
+
+    assert critic.a.item() == pytest.approx(1.0, abs=0.03)
+    assert critic.b.item() == pytest.approx(1.0, abs=0.03)
+
+    query = torch.tensor([0.0, 0.1, 0.25, 0.4, 0.5])
+    predicted = critic.predict_win_prob(query)
+    expected = torch.tensor([0.0, 0.2, 0.5, 0.8, 1.0])
+    assert torch.allclose(predicted, expected, atol=0.02)
+
+
+def test_kumaraswamy_critic_reduces_to_beta_at_b_equals_1():
+    """Kumaraswamy(a, 1) has CDF 1-(1-x^a)=x^a, exactly BetaCritic's CDF —
+    so fit on a genuine Beta(alpha, 1)-shaped sample (the all-pay N=5
+    equilibrium, alpha=1/5) should recover b~1 and a~alpha, matching
+    BetaCritic's own recovery on the same data (see
+    test_beta_critic_recovers_exact_alpha_at_equilibrium_endpoints)."""
+    n_agents = 5
+    v = torch.rand(500_000, dtype=torch.float64)
+    bids = equilibrium_bid_lambda(v, n_agents, 1.0).numpy()  # all-pay, alpha=1/5
+
+    critic = KumaraswamyCritic()
+    critic.fit(bids)
+
+    assert critic.b.item() == pytest.approx(1.0, abs=0.03)
+    assert critic.a.item() == pytest.approx(1.0 / n_agents, abs=0.01)
+
+
+def test_kumaraswamy_critic_is_monotonic():
+    """Monotonic for any a, b > 0 by construction (a convex-combination-
+    free single CDF this time, but the same algebraic fact: F(x)=
+    1-(1-x^a)^b is a composition of monotonic non-decreasing functions in
+    x), not something fit() needs to achieve."""
+    rng = np.random.default_rng(1)
+    query = torch.linspace(0.0, 1.0, 200)
+    for _ in range(5):
+        critic = KumaraswamyCritic()
+        critic.a = torch.tensor(float(rng.uniform(0.1, 5.0)))
+        critic.b = torch.tensor(float(rng.uniform(0.1, 5.0)))
+        critic.scale = torch.tensor(1.0)
+
+        predicted = critic.predict_win_prob(query)
+        diffs = predicted[1:] - predicted[:-1]
+        assert torch.all(diffs >= -1e-6)
+
+
+def test_kumaraswamy_critic_gradient_flows_through_bid():
+    rng = np.random.default_rng(2)
+    bids = rng.uniform(0.0, 0.5, size=50_000)
+
+    critic = KumaraswamyCritic()
+    critic.fit(bids)
+
+    b = torch.tensor([0.3], requires_grad=True)
+    p_win = critic.predict_win_prob(b)
+    p_win.backward()
+
+    assert b.grad is not None
+    assert b.grad.item() > 0
+
+
+def test_kumaraswamy_critic_state_dict_round_trip():
+    rng = np.random.default_rng(4)
+    bids = rng.uniform(0.0, 0.5, size=10_000)
+
+    critic = KumaraswamyCritic()
+    critic.fit(bids)
+    query = torch.linspace(0.0, 1.0, 20)
+    before = critic.predict_win_prob(query)
+
+    state = critic.state_dict()
+    restored = KumaraswamyCritic()
+    restored.load_state_dict(state)
+    after = restored.predict_win_prob(query)
+
+    assert torch.allclose(before, after)
+
+
+def test_kumaraswamy_critic_fits_non_power_law_shape_better_than_single_beta():
+    """The whole point of the second shape parameter: a genuine
+    Kumaraswamy(a, b)-shaped sample with b far from 1 (so not a power law,
+    not something BetaCritic's fixed-b=1 family can represent) should be
+    fit measurably better by KumaraswamyCritic than by BetaCritic."""
+    rng = np.random.default_rng(5)
+    a_true, b_true = 2.0, 4.0
+    u = rng.uniform(0.0, 1.0, size=100_000)
+    bids = (1.0 - (1.0 - u) ** (1.0 / b_true)) ** (1.0 / a_true)  # inverse-CDF sampling
+
+    query = torch.linspace(0.0, 1.0, 300)
+    true_cdf = 1.0 - (1.0 - query ** a_true) ** b_true
+
+    single = BetaCritic()
+    single.fit(bids)
+    single_err = (single.predict_win_prob(query) - true_cdf).abs().max().item()
+
+    kumaraswamy = KumaraswamyCritic()
+    kumaraswamy.fit(bids)
+    kumaraswamy_err = (kumaraswamy.predict_win_prob(query) - true_cdf).abs().max().item()
+
+    assert kumaraswamy_err < single_err
+    assert kumaraswamy_err < 0.02
 
 
 def test_monotonic_nn_critic_matches_uniform_distribution():

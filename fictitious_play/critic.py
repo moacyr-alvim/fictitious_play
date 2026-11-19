@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from scipy.optimize import minimize_scalar
 
 
 class SplineCritic:
@@ -270,6 +271,113 @@ class MixtureBetaCritic:
         x = (bids / self.scale).clamp(self.eps, 1.0)
         component_cdfs = x.unsqueeze(-1) ** self.alpha
         return (component_cdfs * self.pi).sum(-1)
+
+
+class KumaraswamyCritic:
+    """Estimates P(win | b) = P(opponent's bid < b) with a scaled
+    Kumaraswamy(a, b) distribution: F(x) = 1 - (1 - (x/scale)^a)^b.
+
+    Kumaraswamy is the classic closed-form-CDF alternative to the general
+    Beta(a, b) (whose CDF needs the regularized incomplete beta function,
+    no closed form, not implemented for autograd in this PyTorch version).
+    It strictly generalizes BetaCritic: setting b=1 gives
+    F(x) = 1 - (1 - x^a) = x^a, exactly BetaCritic's CDF. The second free
+    shape parameter is the whole point — it targets the same residual bias
+    BetaCritic has whenever the true equilibrium isn't a pure power law
+    (e.g. the asymmetric risk-aversion auction, see
+    docs/findings_risk_aversion.md), without assuming any particular
+    non-power-law shape the way a fixed mixture or a neural net would.
+
+    Fitting is still (almost) closed-form, via the same kind of
+    exponential-transform trick used in BetaCritic and MixtureBetaCritic:
+    if X ~ Kumaraswamy(a, b), then X^a ~ Beta(1, b), and for U ~ Beta(1, b),
+    -log(1 - U) ~ Exponential(b). So for any *fixed* a, the MLE of b is
+    closed-form:
+
+        b_hat(a) = n / sum(-log(1 - x_i^a))
+
+    which collapses the full 2-parameter MLE into a 1-D search over a
+    alone (maximizing the profile log-likelihood with b_hat(a) plugged
+    in) — a bounded scalar optimization (`scipy.optimize.minimize_scalar`),
+    not a gradient-descent loop over thousands of steps, and not an EM
+    iteration over multiple components. Still carries model bias away from
+    the true equilibrium in general (no particular equilibrium in this
+    project is known to be exactly Kumaraswamy-shaped, unlike BetaCritic's
+    exact match at the first-price/all-pay/payment_share-continuum
+    endpoints) — the bet is that 2 genuine shape parameters fit real
+    equilibria's curvature better than BetaCritic's 1, at a similar or
+    lower fitting cost than MixtureBetaCritic's K components.
+    """
+
+    def __init__(self, device: torch.device | str | None = None,
+                 min_a: float = 1e-3, max_a: float = 50.0,
+                 min_b: float = 1e-3, eps: float = 1e-6):
+        self.device = torch.device(device) if device else torch.device("cpu")
+        self.min_a = min_a
+        self.max_a = max_a
+        self.min_b = min_b
+        self.eps = eps
+        self.a: torch.Tensor | None = None
+        self.b: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+
+    def state_dict(self) -> dict:
+        return {
+            "a": self.a.item() if self.a is not None else None,
+            "b": self.b.item() if self.b is not None else None,
+            "scale": self.scale.item() if self.scale is not None else None,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if state["a"] is not None:
+            self.a = torch.tensor(state["a"], dtype=torch.float32, device=self.device)
+            self.b = torch.tensor(state["b"], dtype=torch.float32, device=self.device)
+            self.scale = torch.tensor(state["scale"], dtype=torch.float32, device=self.device)
+
+    def _neg_profile_log_likelihood(self, a: float, log_x: np.ndarray,
+                                     n: int) -> float:
+        a = max(a, self.min_a)
+        # log(1 - x^a) computed as log1p(-exp(a*log_x)) for precision when
+        # x^a is close to 0 or 1, same spirit as BetaCritic's log-space care.
+        log_one_minus_xa = np.log1p(-np.exp(np.clip(a * log_x, None, -1e-12)))
+        sum_y = -log_one_minus_xa.sum()  # y_i = -log(1 - x_i^a) ~ Exponential(b)
+        if not np.isfinite(sum_y) or sum_y <= 0:
+            return np.inf
+        b_hat = max(n / sum_y, self.min_b)
+        log_lik = (n * np.log(a) + n * np.log(b_hat) + (a - 1) * log_x.sum()
+                   + (b_hat - 1) * log_one_minus_xa.sum())
+        return -log_lik
+
+    def fit(self, opponent_bids: np.ndarray) -> None:
+        bids = np.asarray(opponent_bids, dtype=np.float64)
+        scale = float(bids.max())
+        if scale <= 0:
+            scale = self.eps
+
+        # Same care as BetaCritic: only clip the x=0 singularity (float64
+        # underflow), not a larger eps, to avoid biasing the fit.
+        x = np.clip(bids / scale, np.finfo(np.float64).tiny, 1.0)
+        log_x = np.log(x)
+        n = len(x)
+
+        result = minimize_scalar(
+            self._neg_profile_log_likelihood, args=(log_x, n),
+            bounds=(self.min_a, self.max_a), method="bounded",
+        )
+        a_hat = float(result.x)
+        log_one_minus_xa = np.log1p(-np.exp(np.clip(a_hat * log_x, None, -1e-12)))
+        b_hat = max(n / -log_one_minus_xa.sum(), self.min_b)
+
+        self.a = torch.tensor(a_hat, dtype=torch.float32, device=self.device)
+        self.b = torch.tensor(b_hat, dtype=torch.float32, device=self.device)
+        self.scale = torch.tensor(scale, dtype=torch.float32, device=self.device)
+
+    def predict_win_prob(self, bids: torch.Tensor) -> torch.Tensor:
+        if self.a is None:
+            raise RuntimeError("KumaraswamyCritic must be fit before calling predict_win_prob.")
+        x = (bids / self.scale).clamp(self.eps, 1.0)
+        one_minus_xa = (1.0 - x ** self.a).clamp(min=self.eps)
+        return 1.0 - one_minus_xa ** self.b
 
 
 class MonotonicNNCritic:
