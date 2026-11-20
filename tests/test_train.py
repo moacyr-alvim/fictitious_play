@@ -532,3 +532,66 @@ def test_wallet_game_trains_without_error_with_kumaraswamy_critic():
     )
     history = trainer.run(verbose=False)
     assert len(history) == 3
+
+
+def test_asymmetric_value_exponents_rejects_n_agents_other_than_two():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=3, asymmetric_value_exponents=(1.0, 2.0))
+
+
+def test_asymmetric_value_exponents_rejects_non_first_price():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, auction_type="all_pay",
+                               asymmetric_value_exponents=(1.0, 2.0))
+
+
+def test_asymmetric_value_exponents_rejects_other_variants():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, risk_aversion=[1.0, 0.6],
+                               asymmetric_value_exponents=(1.0, 2.0))
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1,
+                               asymmetric_value_exponents=(1.0, 2.0))
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_wallet_game=True,
+                               asymmetric_value_exponents=(1.0, 2.0))
+
+
+def test_asymmetric_value_exponents_samples_each_agent_from_own_distribution():
+    trainer = FictitiousPlayTrainer(n_agents=2, asymmetric_value_exponents=(1.0, 2.0),
+                                     sample_size=200_000, seed=0)
+    v0 = trainer._sample_v(200_000, 0)
+    v1 = trainer._sample_v(200_000, 1)
+    # F_i(v) = v**r_i => E[V] = r_i / (r_i + 1): 0.5 for r=1, 2/3 for r=2.
+    assert v0.mean().item() == pytest.approx(0.5, abs=0.01)
+    assert v1.mean().item() == pytest.approx(2.0 / 3.0, abs=0.01)
+
+
+def test_asymmetric_value_exponents_benchmark_metrics_return_nan():
+    trainer = FictitiousPlayTrainer(n_agents=2, asymmetric_value_exponents=(1.0, 2.0),
+                                     sample_size=100, seed=0)
+    mse, max_diff = trainer._benchmark_metrics(0)
+    assert mse != mse  # NaN != NaN
+    assert max_diff != max_diff
+
+
+def test_asymmetric_value_exponents_is_compatible_with_pinn_opponent_weight():
+    # Unlike the common_value_* variants, this is still a private-value
+    # auction, so the PINN FOC regularizer needs no custom correction here.
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=2, sample_size=5_000, max_steps=50, patience=10,
+        asymmetric_value_exponents=(1.0, 2.0), pinn_opponent_weight=0.1,
+        max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 2
+
+
+def test_asymmetric_value_exponents_trains_without_error_with_kumaraswamy_critic():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        asymmetric_value_exponents=(1.0, 2.0), critic_type="kumaraswamy",
+        max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 3

@@ -206,6 +206,7 @@ class FictitiousPlayTrainer:
                  common_value_noise: float | None = None,
                  common_value_gaussian: tuple[float, float, float] | None = None,
                  common_value_wallet_game: bool = False,
+                 asymmetric_value_exponents: tuple[float, float] | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
                  pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
                  opponent_ema_decay_schedule: tuple[float, float] | None = None,
@@ -335,6 +336,47 @@ class FictitiousPlayTrainer:
                                   "pinn_opponent_weight (it supplies its own FOC-based "
                                   "value correction instead)")
         self.common_value_wallet_game = common_value_wallet_game
+        # N=2 first-price, asymmetric PRIVATE values: each agent i's own
+        # value V_i is independently drawn from its own power distribution
+        # F_i(v) = v**r_i on the SAME support [0,1] (r_i=1 recovers plain
+        # Uniform(0,1); r_i>1 concentrates mass near 1, i.e. a "stronger"
+        # bidder stochastically more likely to have high values). Unlike
+        # the three common_value_* variants above, this is still a private-
+        # value auction (no shared unknown true value, no winner's-curse
+        # correction, no opponent-actor inversion needed): the only change
+        # is that _sample_v must know *which* agent is sampling. No known
+        # closed-form equilibrium for this case: the natural FOC-based ODE
+        # system (derived by hand while exploring this) turned out not to
+        # satisfy the standard same-support boundary condition (both
+        # inverse bid functions reaching the top value at the same bid) —
+        # pure existence of *an* equilibrium is still guaranteed by general
+        # theorems (Lebrun 1999, Maskin & Riley 2000) for continuous,
+        # atomless, compact-support private values, but pinning down its
+        # exact shape would need a more careful literature-accurate
+        # derivation than attempted here. So, like common_value_gaussian,
+        # this is exploratory: _benchmark_metrics returns NaN and
+        # --max-diff-threshold must be disabled (rely on --payoff-rel-tol).
+        # Compatible with pinn_weight/pinn_opponent_weight (their FOC math
+        # doesn't assume any particular value distribution) — unlike the
+        # common_value_* variants, this needs no custom payoff correction,
+        # so it's the one case here NOT required to disable them.
+        if asymmetric_value_exponents is not None:
+            if n_agents != 2:
+                raise ValueError("asymmetric_value_exponents is only supported for n_agents=2")
+            if len(asymmetric_value_exponents) != n_agents:
+                raise ValueError("asymmetric_value_exponents must have one exponent per agent")
+            is_first_price = (payment_share == 0.0 or
+                               (payment_share is None and auction_type == "first_price"))
+            if not is_first_price:
+                raise ValueError("asymmetric_value_exponents is only supported for first-price "
+                                  "(payment_share=0 or auction_type='first_price')")
+            if (risk_aversion is not None or common_value_noise is not None
+                    or common_value_gaussian is not None or common_value_wallet_game):
+                raise ValueError("asymmetric_value_exponents is not compatible with "
+                                  "risk_aversion or any common_value_* variant")
+        self.asymmetric_value_exponents = (
+            tuple(asymmetric_value_exponents) if asymmetric_value_exponents is not None else None
+        )
         # Weight on the usual critic-based expected-payoff loss (1.0 =
         # plain fictitious play). Set to 0 together with pinn_weight=0 to
         # train purely on pinn_opponent_weight's residual instead.
@@ -429,11 +471,14 @@ class FictitiousPlayTrainer:
         self.growth_rounds: list[int] = []
         self._frozen_since_round: int | None = None
 
-    def _sample_v(self, n: int) -> torch.Tensor:
+    def _sample_v(self, n: int, agent_idx: int | None = None) -> torch.Tensor:
         """Samples n draws of whatever the actor conditions its bid on:
         the agent's own valuation normally, or (common_value_noise mode)
         its own private signal, restricted to the interior region the
-        common-value equilibrium is valid in."""
+        common-value equilibrium is valid in. agent_idx is only consulted
+        under asymmetric_value_exponents (every other mode samples all
+        agents identically), where it selects which agent's own power-
+        distribution exponent to draw from."""
         if self.common_value_noise is not None:
             lo, hi = common_value_interior_range(self.common_value_noise)
             return torch.rand(n, 1, device=self.device) * (hi - lo) + lo
@@ -441,11 +486,15 @@ class FictitiousPlayTrainer:
             prior_mean, prior_std, noise_std = self.common_value_gaussian
             signal_std = (prior_std ** 2 + noise_std ** 2) ** 0.5
             return torch.randn(n, 1, device=self.device) * signal_std + prior_mean
+        if self.asymmetric_value_exponents is not None:
+            # Inverse-CDF sampling: F(v) = v**r on [0,1] => v = U**(1/r).
+            r = self.asymmetric_value_exponents[agent_idx]
+            return torch.rand(n, 1, device=self.device) ** (1.0 / r)
         return torch.rand(n, 1, device=self.device)
 
     def _fresh_bids(self, agent_idx: int) -> np.ndarray:
         with torch.no_grad():
-            v = self._sample_v(self.sample_size)
+            v = self._sample_v(self.sample_size, agent_idx)
             b = self.agents[agent_idx](v)
         return b.squeeze(1).cpu().numpy()
 
@@ -775,7 +824,7 @@ class FictitiousPlayTrainer:
             opponent_actors = [self.ema_agents[i] for i in range(self.n_agents) if i != mover_idx]
 
         for step in range(self.max_steps):
-            v = self._sample_v(self.batch_size)
+            v = self._sample_v(self.batch_size, mover_idx)
             b = actor(v)
             loss = torch.zeros((), device=self.device)
 
@@ -892,10 +941,11 @@ class FictitiousPlayTrainer:
         as a diagnostic; max_abs_diff (the sup-norm deviation) drives the
         stopping decision, since it cannot be satisfied while a whole
         region of valuations is still poorly fit — unlike an average."""
-        if self.common_value_gaussian is not None:
-            # No known closed-form equilibrium for this variant (see
-            # common_value_posterior_mean_gaussian's docstring) — nothing
-            # to benchmark against yet.
+        if self.common_value_gaussian is not None or self.asymmetric_value_exponents is not None:
+            # No known closed-form equilibrium for either variant (see
+            # common_value_posterior_mean_gaussian's docstring, and the
+            # asymmetric_value_exponents comment in __init__) — nothing to
+            # benchmark against yet.
             return float("nan"), float("nan")
         actor = self.agents[agent_idx]
         with torch.no_grad():
@@ -978,15 +1028,24 @@ class FictitiousPlayTrainer:
                 payoff = win * (v_true - b_self)
                 return payoff.mean().item()
 
-            v_self = torch.rand(n, 1, device=self.device)
-            b_self = self.agents[agent_idx](v_self).squeeze(1)
+            if self.asymmetric_value_exponents is not None:
+                v_self = self._sample_v(n, agent_idx)
+                b_self = self.agents[agent_idx](v_self).squeeze(1)
+                b_opp = torch.stack(
+                    [self.agents[idx](self._sample_v(n, idx)).squeeze(1)
+                     for idx in opponent_indices],
+                    dim=1,
+                )
+            else:
+                v_self = torch.rand(n, 1, device=self.device)
+                b_self = self.agents[agent_idx](v_self).squeeze(1)
 
-            v_opp = torch.rand(n, len(opponent_indices), device=self.device)
-            b_opp = torch.stack(
-                [self.agents[idx](v_opp[:, k:k + 1]).squeeze(1)
-                 for k, idx in enumerate(opponent_indices)],
-                dim=1,
-            )
+                v_opp = torch.rand(n, len(opponent_indices), device=self.device)
+                b_opp = torch.stack(
+                    [self.agents[idx](v_opp[:, k:k + 1]).squeeze(1)
+                     for k, idx in enumerate(opponent_indices)],
+                    dim=1,
+                )
             max_opp = b_opp.max(dim=1).values
 
             win = (b_self > max_opp).float()
@@ -1039,6 +1098,7 @@ class FictitiousPlayTrainer:
             "common_value_noise": self.common_value_noise,
             "common_value_gaussian": self.common_value_gaussian,
             "common_value_wallet_game": self.common_value_wallet_game,
+            "asymmetric_value_exponents": self.asymmetric_value_exponents,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -1119,6 +1179,8 @@ class FictitiousPlayTrainer:
             self.common_value_gaussian = checkpoint["common_value_gaussian"]
         if "common_value_wallet_game" in checkpoint:
             self.common_value_wallet_game = checkpoint["common_value_wallet_game"]
+        if "asymmetric_value_exponents" in checkpoint:
+            self.asymmetric_value_exponents = checkpoint["asymmetric_value_exponents"]
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
@@ -1166,6 +1228,8 @@ class FictitiousPlayTrainer:
                     theo_str = "teórico=n/a (common_value)"
                 elif self.common_value_gaussian is not None:
                     theo_str = "teórico=n/a (common_value_gaussian)"
+                elif self.asymmetric_value_exponents is not None:
+                    theo_str = "teórico=n/a (asymmetric_value)"
                 else:
                     theo_str = f"teórico={theoretical_expected_payoff(self.n_agents):.5f}"
                 print(f"Round {round_idx:3d} | mover=agent{mover_idx} | steps={steps_taken:5d} "

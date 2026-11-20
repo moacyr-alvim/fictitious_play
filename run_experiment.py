@@ -110,6 +110,20 @@ def parse_args():
                               "Actor can't represent). Incompatible with --risk-aversion/"
                               "--common-value-noise/--common-value-gaussian and "
                               "--pinn-weight/--pinn-opponent-weight > 0.")
+    parser.add_argument("--asymmetric-value-exponents", type=float, nargs=2, default=None,
+                         metavar=("R0", "R1"),
+                         help="N=2 first-price auction with asymmetric PRIVATE values: each "
+                              "agent i's value independently drawn from its own power "
+                              "distribution F_i(v)=v**Ri on the same support [0,1] (Ri=1 is "
+                              "plain Uniform(0,1); Ri>1 concentrates mass near 1, a "
+                              "stochastically 'stronger' bidder). Still a private-value "
+                              "auction (no winner's-curse correction needed), so it IS "
+                              "compatible with --pinn-weight/--pinn-opponent-weight, unlike "
+                              "the common_value_* variants. No known closed-form "
+                              "equilibrium though, so this is exploratory like "
+                              "--common-value-gaussian: pass --max-diff-threshold -1 and "
+                              "rely on --payoff-rel-tol for early stopping instead. "
+                              "Incompatible with --risk-aversion and any --common-value-*.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -140,6 +154,7 @@ def main():
         common_value_noise=args.common_value_noise,
         common_value_gaussian=args.common_value_gaussian,
         common_value_wallet_game=args.common_value_wallet_game,
+        asymmetric_value_exponents=args.asymmetric_value_exponents,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,
