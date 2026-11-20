@@ -14,6 +14,15 @@ def parse_args():
     parser.add_argument("--sample-size", type=int, default=300_000)
     parser.add_argument("--patience", type=int, default=200)
     parser.add_argument("--max-steps", type=int, default=20_000)
+    parser.add_argument("--tol", type=float, default=1e-6,
+                         help="Absolute EMA-loss-plateau threshold ending a round's best "
+                              "response early (before --max-steps). Calibrated for losses on "
+                              "an O(1) scale (every other auction variant trains on [0,1] "
+                              "valuations) — needs scaling up roughly with the square of "
+                              "whatever scale the payoff loss is on for variants with a "
+                              "different natural scale (e.g. --common-value-gaussian with "
+                              "values ~100 needs something like 1e-2, not the default 1e-6, "
+                              "or every round burns the full --max-steps budget).")
     parser.add_argument("--belief-decay", type=float, default=0.9,
                          help="Fraction of each agent's belief buffer kept per update "
                               "(0 = no memory / latest snapshot only).")
@@ -111,6 +120,7 @@ def main():
     trainer = FictitiousPlayTrainer(
         n_agents=args.n_agents, n_rounds=args.n_rounds,
         sample_size=args.sample_size, patience=args.patience, max_steps=args.max_steps,
+        tol=args.tol,
         belief_decay=args.belief_decay,
         critic_n_quantiles=args.critic_n_quantiles, critic_type=args.critic_type,
         actor_hidden_size=args.actor_hidden_size,
