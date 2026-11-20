@@ -443,3 +443,44 @@ def test_common_value_trains_without_error_with_kumaraswamy_critic():
     )
     history = trainer.run(verbose=False)
     assert len(history) == 3
+
+
+def test_common_value_gaussian_rejects_n_agents_other_than_two():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=3, common_value_gaussian=(100.0, 10.0, 2.0))
+
+
+def test_common_value_gaussian_rejects_non_first_price():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, auction_type="all_pay",
+                               common_value_gaussian=(100.0, 10.0, 2.0))
+
+
+def test_common_value_gaussian_rejects_common_value_noise_combo():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1,
+                               common_value_gaussian=(100.0, 10.0, 2.0))
+
+
+def test_common_value_gaussian_rejects_pinn_weight():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_gaussian=(100.0, 10.0, 2.0),
+                               pinn_weight=0.1)
+
+
+def test_common_value_gaussian_benchmark_metrics_return_nan():
+    trainer = FictitiousPlayTrainer(n_agents=2, common_value_gaussian=(100.0, 10.0, 2.0),
+                                     sample_size=100, seed=0)
+    mse, max_diff = trainer._benchmark_metrics(0)
+    assert mse != mse  # NaN != NaN
+    assert max_diff != max_diff
+
+
+def test_common_value_gaussian_trains_without_error_with_kumaraswamy_critic():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        common_value_gaussian=(100.0, 10.0, 2.0), critic_type="kumaraswamy",
+        max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 3

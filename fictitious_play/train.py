@@ -8,6 +8,7 @@ from .actor import Actor
 from .benchmark import (
     AUCTION_TYPES,
     common_value_interior_range,
+    common_value_posterior_mean_gaussian,
     equilibrium_bid,
     equilibrium_bid_common_value,
     equilibrium_bid_lambda,
@@ -202,6 +203,7 @@ class FictitiousPlayTrainer:
                  auction_type: str = "first_price", payment_share: float | None = None,
                  risk_aversion: list[float] | None = None,
                  common_value_noise: float | None = None,
+                 common_value_gaussian: tuple[float, float, float] | None = None,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
                  pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
                  opponent_ema_decay_schedule: tuple[float, float] | None = None,
@@ -271,6 +273,36 @@ class FictitiousPlayTrainer:
                                   "pinn_opponent_weight (it supplies its own FOC-based "
                                   "value correction instead)")
         self.common_value_noise = common_value_noise
+        # Same common-value auction, but V and the per-agent signal noise
+        # are Normal instead of Uniform: (prior_mean, prior_std, noise_std),
+        # V ~ Normal(prior_mean, prior_std^2), S_i = V + Normal(0,
+        # noise_std^2). Unbounded support means there's no "interior
+        # region" boundary caveat the way common_value_noise has — but also
+        # no known closed-form equilibrium (see
+        # benchmark.common_value_posterior_mean_gaussian's docstring for
+        # why), so this is exploratory: _benchmark_metrics returns NaN
+        # (nothing to compare against) rather than a real MSE/MaxDiff, and
+        # --max-diff-threshold must be disabled (rely on --payoff-rel-tol
+        # instead, exactly like risk_aversion/common_value_noise already
+        # require for their own theoretical-payoff-free reasons).
+        if common_value_gaussian is not None:
+            if n_agents != 2:
+                raise ValueError("common_value_gaussian is only supported for n_agents=2")
+            is_first_price = (payment_share == 0.0 or
+                               (payment_share is None and auction_type == "first_price"))
+            if not is_first_price:
+                raise ValueError("common_value_gaussian is only supported for first-price "
+                                  "(payment_share=0 or auction_type='first_price')")
+            if risk_aversion is not None or common_value_noise is not None:
+                raise ValueError("common_value_gaussian is not compatible with risk_aversion "
+                                  "or common_value_noise")
+            if pinn_weight > 0 or pinn_opponent_weight > 0:
+                raise ValueError("common_value_gaussian is not compatible with pinn_weight/"
+                                  "pinn_opponent_weight (it supplies its own FOC-based "
+                                  "value correction instead)")
+        self.common_value_gaussian = (
+            tuple(common_value_gaussian) if common_value_gaussian is not None else None
+        )
         # Weight on the usual critic-based expected-payoff loss (1.0 =
         # plain fictitious play). Set to 0 together with pinn_weight=0 to
         # train purely on pinn_opponent_weight's residual instead.
@@ -373,6 +405,10 @@ class FictitiousPlayTrainer:
         if self.common_value_noise is not None:
             lo, hi = common_value_interior_range(self.common_value_noise)
             return torch.rand(n, 1, device=self.device) * (hi - lo) + lo
+        if self.common_value_gaussian is not None:
+            prior_mean, prior_std, noise_std = self.common_value_gaussian
+            signal_std = (prior_std ** 2 + noise_std ** 2) ** 0.5
+            return torch.randn(n, 1, device=self.device) * signal_std + prior_mean
         return torch.rand(n, 1, device=self.device)
 
     def _fresh_bids(self, agent_idx: int) -> np.ndarray:
@@ -740,6 +776,29 @@ class FictitiousPlayTrainer:
                         )
                         v_common = (v + opponent_signal) / 2.0
                         payoff_loss = -(p_win * (v_common - b)).mean()
+                    elif self.common_value_gaussian is not None:
+                        # Same idea as common_value_noise, but the
+                        # winner's-curse correction is
+                        # common_value_posterior_mean_gaussian instead of
+                        # the uniform-noise model's (x+y)/2, and the
+                        # opponent-inversion search domain is a wide
+                        # (prior_mean +/- 6*signal_std) band rather than an
+                        # exact "interior region" — unbounded support means
+                        # there's no exact boundary to match, just a
+                        # generous practical search range.
+                        opponent_idx = next(i for i in range(self.n_agents) if i != mover_idx)
+                        prior_mean, prior_std, noise_std = self.common_value_gaussian
+                        signal_std = (prior_std ** 2 + noise_std ** 2) ** 0.5
+                        domain_lo = prior_mean - 6 * signal_std
+                        domain_hi = prior_mean + 6 * signal_std
+                        opponent_signal, _ = opponent_inverse_and_slope(
+                            self.ema_agents[opponent_idx], b,
+                            domain_lo=domain_lo, domain_hi=domain_hi,
+                        )
+                        v_common = common_value_posterior_mean_gaussian(
+                            v, opponent_signal, prior_mean, prior_std, noise_std
+                        )
+                        payoff_loss = -(p_win * (v_common - b)).mean()
                     else:
                         # Generalized payment rule: winner pays b, losers pay
                         # lam * b. E[payoff] = P(win)*(v - (1-lam)*b) - lam*b
@@ -782,6 +841,11 @@ class FictitiousPlayTrainer:
         as a diagnostic; max_abs_diff (the sup-norm deviation) drives the
         stopping decision, since it cannot be satisfied while a whole
         region of valuations is still poorly fit — unlike an average."""
+        if self.common_value_gaussian is not None:
+            # No known closed-form equilibrium for this variant (see
+            # common_value_posterior_mean_gaussian's docstring) — nothing
+            # to benchmark against yet.
+            return float("nan"), float("nan")
         actor = self.agents[agent_idx]
         with torch.no_grad():
             pred = actor(self.eval_grid)
@@ -820,6 +884,22 @@ class FictitiousPlayTrainer:
                 b_self = self.agents[agent_idx](s_self).squeeze(1)
                 s_opp = v_true + (torch.rand(n, len(opponent_indices), device=self.device)
                                    * 2 - 1) * noise
+                b_opp = torch.stack(
+                    [self.agents[idx](s_opp[:, k:k + 1]).squeeze(1)
+                     for k, idx in enumerate(opponent_indices)],
+                    dim=1,
+                )
+                max_opp = b_opp.max(dim=1).values
+                win = (b_self > max_opp).float()
+                payoff = win * (v_true.squeeze(1) - b_self)
+                return payoff.mean().item()
+
+            if self.common_value_gaussian is not None:
+                prior_mean, prior_std, noise_std = self.common_value_gaussian
+                v_true = torch.randn(n, 1, device=self.device) * prior_std + prior_mean
+                s_self = v_true + torch.randn(n, 1, device=self.device) * noise_std
+                b_self = self.agents[agent_idx](s_self).squeeze(1)
+                s_opp = v_true + torch.randn(n, len(opponent_indices), device=self.device) * noise_std
                 b_opp = torch.stack(
                     [self.agents[idx](s_opp[:, k:k + 1]).squeeze(1)
                      for k, idx in enumerate(opponent_indices)],
@@ -889,6 +969,7 @@ class FictitiousPlayTrainer:
             "payment_share": self.payment_share,
             "risk_aversion": self.risk_aversion,
             "common_value_noise": self.common_value_noise,
+            "common_value_gaussian": self.common_value_gaussian,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -965,6 +1046,8 @@ class FictitiousPlayTrainer:
             self.risk_aversion = checkpoint["risk_aversion"]
         if "common_value_noise" in checkpoint:
             self.common_value_noise = checkpoint["common_value_noise"]
+        if "common_value_gaussian" in checkpoint:
+            self.common_value_gaussian = checkpoint["common_value_gaussian"]
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:
@@ -1010,6 +1093,8 @@ class FictitiousPlayTrainer:
                     theo_str = "teórico=n/a (risk_aversion)"
                 elif self.common_value_noise is not None:
                     theo_str = "teórico=n/a (common_value)"
+                elif self.common_value_gaussian is not None:
+                    theo_str = "teórico=n/a (common_value_gaussian)"
                 else:
                     theo_str = f"teórico={theoretical_expected_payoff(self.n_agents):.5f}"
                 print(f"Round {round_idx:3d} | mover=agent{mover_idx} | steps={steps_taken:5d} "

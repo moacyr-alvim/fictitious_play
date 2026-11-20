@@ -1,10 +1,12 @@
 import numpy as np
+import pytest
 import torch
 from scipy.optimize import minimize_scalar
 
 from fictitious_play.benchmark import (
     common_value_interior_range,
     common_value_posterior_mean,
+    common_value_posterior_mean_gaussian,
     equilibrium_bid_all_pay,
     equilibrium_bid_common_value,
     equilibrium_bid_first_price,
@@ -158,3 +160,33 @@ def test_common_value_equilibrium_is_mutual_best_response():
         assert abs(res.x - b_pred) < 0.01, (
             f"noise={noise}, x={x}: best response {res.x} != solved bid {b_pred}"
         )
+
+
+def test_common_value_posterior_mean_gaussian_matches_bivariate_normal_conditioning():
+    """Cross-check common_value_posterior_mean_gaussian's closed form against
+    a direct bivariate-normal conditional-mean computation (matrix inversion,
+    independent of the formula's own derivation)."""
+    prior_mean, prior_std, noise_std = 100.0, 10.0, 2.0
+    var_v = prior_std ** 2
+    var_signal = var_v + noise_std ** 2
+    cov = np.array([[var_signal, var_v], [var_v, var_signal]])
+    cov_v_s = np.array([var_v, var_v])
+
+    for x, y in [(100.0, 100.0), (110.0, 95.0), (80.0, 120.0)]:
+        delta = np.array([x - prior_mean, y - prior_mean])
+        expected = prior_mean + cov_v_s @ np.linalg.solve(cov, delta)
+        got = common_value_posterior_mean_gaussian(
+            torch.tensor([x]), torch.tensor([y]), prior_mean, prior_std, noise_std
+        ).item()
+        assert got == pytest.approx(expected, abs=1e-6)
+
+
+def test_common_value_posterior_mean_gaussian_shrinks_toward_prior_on_diagonal():
+    """Unlike the uniform-noise model (where matching signals exactly
+    recover x — see test_common_value_posterior_mean_reduces_to_own_signal_
+    on_diagonal), an informative Gaussian prior always shrinks the diagonal
+    estimate toward prior_mean, even when both signals agree exactly."""
+    prior_mean, prior_std, noise_std = 100.0, 10.0, 2.0
+    x = torch.tensor([120.0])
+    estimate = common_value_posterior_mean_gaussian(x, x, prior_mean, prior_std, noise_std)
+    assert prior_mean < estimate.item() < x.item()

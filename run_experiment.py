@@ -80,6 +80,17 @@ def parse_args():
                               "--pinn-opponent-weight > 0 (supplies its own FOC-based value "
                               "correction instead) — see "
                               "fictitious_play.benchmark.equilibrium_bid_common_value.")
+    parser.add_argument("--common-value-gaussian", type=float, nargs=3, default=None,
+                         metavar=("PRIOR_MEAN", "PRIOR_STD", "NOISE_STD"),
+                         help="Like --common-value-noise, but V~Normal(PRIOR_MEAN, PRIOR_STD^2) "
+                              "and each signal's noise~Normal(0, NOISE_STD^2) instead of "
+                              "Uniform — unbounded support means no 'interior region' boundary "
+                              "caveat, but also no known closed-form equilibrium (see "
+                              "fictitious_play.benchmark.common_value_posterior_mean_gaussian), "
+                              "so this is exploratory: pass --max-diff-threshold -1 (no "
+                              "equilibrium to compare against) and rely on --payoff-rel-tol for "
+                              "early stopping instead. Same n_agents=2/first-price/pinn-weight "
+                              "restrictions as --common-value-noise.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -107,6 +118,7 @@ def main():
         pinn_weight=args.pinn_weight, pinn_opponent_weight=args.pinn_opponent_weight,
         opponent_ema_decay=args.opponent_ema_decay, risk_aversion=args.risk_aversion,
         common_value_noise=args.common_value_noise,
+        common_value_gaussian=args.common_value_gaussian,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

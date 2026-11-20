@@ -296,3 +296,32 @@ def common_value_posterior_mean(own_signal: torch.Tensor, other_signal: torch.Te
     posteriors actually overlap), not just at other_signal == own_signal.
     """
     return (own_signal + other_signal) / 2.0
+
+
+def common_value_posterior_mean_gaussian(own_signal: torch.Tensor, other_signal: torch.Tensor,
+                                          prior_mean: float, prior_std: float,
+                                          noise_std: float) -> torch.Tensor:
+    """E[V | S_1=own_signal, S_2=other_signal] for the Normal-Normal
+    common-value model: V ~ Normal(prior_mean, prior_std^2), S_i = V +
+    eps_i, eps_i ~ i.i.d. Normal(0, noise_std^2). Standard conjugate-
+    Gaussian/bivariate-normal conditioning gives a closed-form linear
+    formula in both signals, with no boundary caveat at all (every normal
+    distribution here has full support, so unlike
+    equilibrium_bid_common_value's bounded-uniform-noise model, there's no
+    "interior region" restriction needed):
+
+        E[V|x,y] = c*(x+y) + prior_mean*(1-2c),   c = prior_std^2 / (2*prior_std^2 + noise_std^2)
+
+    Dropping the boundary is not a free lunch, though: unlike the uniform-
+    noise model, E[V|x,x] != x here in general (an informative Gaussian
+    prior always shrinks the estimate toward prior_mean, even when both
+    signals agree exactly) — it's prior_mean + 2c*(x-prior_mean), a
+    shrunk version of x. That breaks the algebraic identity that made the
+    uniform-noise equilibrium come out linear (there, the ratio
+    F(x|x)/f(x|x) driving the shading was constant in x; here it's an
+    inverse-Mills-ratio-shaped function of x, genuinely nonlinear), so no
+    closed-form symmetric equilibrium is derived (or implemented) for this
+    variant yet — see docs/findings_common_value.md.
+    """
+    c = prior_std ** 2 / (2 * prior_std ** 2 + noise_std ** 2)
+    return c * (own_signal + other_signal) + prior_mean * (1 - 2 * c)
