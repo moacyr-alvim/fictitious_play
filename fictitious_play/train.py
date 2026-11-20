@@ -13,6 +13,7 @@ from .benchmark import (
     equilibrium_bid_common_value,
     equilibrium_bid_lambda,
     equilibrium_bid_risk_averse,
+    equilibrium_bid_wallet_game,
     theoretical_expected_payoff,
     theoretical_win_probability_risk_averse,
 )
@@ -204,6 +205,7 @@ class FictitiousPlayTrainer:
                  risk_aversion: list[float] | None = None,
                  common_value_noise: float | None = None,
                  common_value_gaussian: tuple[float, float, float] | None = None,
+                 common_value_wallet_game: bool = False,
                  payoff_weight: float = 1.0, pinn_weight: float = 0.0,
                  pinn_opponent_weight: float = 0.0, opponent_ema_decay: float = 0.9,
                  opponent_ema_decay_schedule: tuple[float, float] | None = None,
@@ -303,6 +305,36 @@ class FictitiousPlayTrainer:
         self.common_value_gaussian = (
             tuple(common_value_gaussian) if common_value_gaussian is not None else None
         )
+        # The classic "wallet game": true value V = sum of every agent's
+        # independent Uniform(0,1) signal (see
+        # benchmark.equilibrium_bid_wallet_game). Unlike the two variants
+        # above, signals are independent (no Bayesian updating needed —
+        # your own signal carries no information about anyone else's), so
+        # training needs no special sampling range, just the usual
+        # Uniform(0,1) _sample_v already does. Only wired up for
+        # n_agents=2 so far: the general-N equilibrium bid exceeds the
+        # agent's own signal for n_agents>=3, which this project's Actor
+        # (b=v*sigmoid(...), capped at b<=v) can't represent.
+        if common_value_wallet_game:
+            if n_agents != 2:
+                raise ValueError("common_value_wallet_game training is only wired up for "
+                                  "n_agents=2 (the equilibrium bid exceeds the signal for "
+                                  "n_agents>=3, which the Actor can't represent — see "
+                                  "benchmark.equilibrium_bid_wallet_game)")
+            is_first_price = (payment_share == 0.0 or
+                               (payment_share is None and auction_type == "first_price"))
+            if not is_first_price:
+                raise ValueError("common_value_wallet_game is only supported for first-price "
+                                  "(payment_share=0 or auction_type='first_price')")
+            if (risk_aversion is not None or common_value_noise is not None
+                    or common_value_gaussian is not None):
+                raise ValueError("common_value_wallet_game is not compatible with "
+                                  "risk_aversion, common_value_noise, or common_value_gaussian")
+            if pinn_weight > 0 or pinn_opponent_weight > 0:
+                raise ValueError("common_value_wallet_game is not compatible with pinn_weight/"
+                                  "pinn_opponent_weight (it supplies its own FOC-based "
+                                  "value correction instead)")
+        self.common_value_wallet_game = common_value_wallet_game
         # Weight on the usual critic-based expected-payoff loss (1.0 =
         # plain fictitious play). Set to 0 together with pinn_weight=0 to
         # train purely on pinn_opponent_weight's residual instead.
@@ -799,6 +831,25 @@ class FictitiousPlayTrainer:
                             v, opponent_signal, prior_mean, prior_std, noise_std
                         )
                         payoff_loss = -(p_win * (v_common - b)).mean()
+                    elif self.common_value_wallet_game:
+                        # True value V = v (own signal, known exactly) +
+                        # sum of opponents' independent signals. Unlike
+                        # the two branches above, v itself needs no
+                        # correction (your own signal *is* your exact
+                        # contribution) — only E[sum of opponents'
+                        # signals | you win] does, via each opponent's
+                        # inverted implied signal (same multi-opponent
+                        # loop foc_residual_opponent already uses, written
+                        # out here since n_agents=2 means there's just one
+                        # term, but kept general in case n_agents>=3 ever
+                        # becomes trainable here).
+                        opponent_indices_local = [i for i in range(self.n_agents) if i != mover_idx]
+                        sum_opponent_signals = torch.zeros_like(b)
+                        for opp_idx in opponent_indices_local:
+                            opp_signal, _ = opponent_inverse_and_slope(self.ema_agents[opp_idx], b)
+                            sum_opponent_signals = sum_opponent_signals + opp_signal
+                        v_common = v + sum_opponent_signals / 2.0
+                        payoff_loss = -(p_win * (v_common - b)).mean()
                     else:
                         # Generalized payment rule: winner pays b, losers pay
                         # lam * b. E[payoff] = P(win)*(v - (1-lam)*b) - lam*b
@@ -854,6 +905,8 @@ class FictitiousPlayTrainer:
                                                       tuple(self.risk_aversion))
             elif self.common_value_noise is not None:
                 target = equilibrium_bid_common_value(self.eval_grid, self.common_value_noise)
+            elif self.common_value_wallet_game:
+                target = equilibrium_bid_wallet_game(self.eval_grid, self.n_agents)
             elif self.payment_share is not None:
                 target = equilibrium_bid_lambda(self.eval_grid, self.n_agents, self.payment_share)
             else:
@@ -908,6 +961,21 @@ class FictitiousPlayTrainer:
                 max_opp = b_opp.max(dim=1).values
                 win = (b_self > max_opp).float()
                 payoff = win * (v_true.squeeze(1) - b_self)
+                return payoff.mean().item()
+
+            if self.common_value_wallet_game:
+                s_self = torch.rand(n, 1, device=self.device)
+                b_self = self.agents[agent_idx](s_self).squeeze(1)
+                s_opp = torch.rand(n, len(opponent_indices), device=self.device)
+                b_opp = torch.stack(
+                    [self.agents[idx](s_opp[:, k:k + 1]).squeeze(1)
+                     for k, idx in enumerate(opponent_indices)],
+                    dim=1,
+                )
+                max_opp = b_opp.max(dim=1).values
+                v_true = s_self.squeeze(1) + s_opp.sum(dim=1)
+                win = (b_self > max_opp).float()
+                payoff = win * (v_true - b_self)
                 return payoff.mean().item()
 
             v_self = torch.rand(n, 1, device=self.device)
@@ -970,6 +1038,7 @@ class FictitiousPlayTrainer:
             "risk_aversion": self.risk_aversion,
             "common_value_noise": self.common_value_noise,
             "common_value_gaussian": self.common_value_gaussian,
+            "common_value_wallet_game": self.common_value_wallet_game,
             "converged": converged,
             "agent_block_widths": [[block.width for block in a.blocks] for a in self.agents],
             "agents": [a.state_dict() for a in self.agents],
@@ -1048,6 +1117,8 @@ class FictitiousPlayTrainer:
             self.common_value_noise = checkpoint["common_value_noise"]
         if "common_value_gaussian" in checkpoint:
             self.common_value_gaussian = checkpoint["common_value_gaussian"]
+        if "common_value_wallet_game" in checkpoint:
+            self.common_value_wallet_game = checkpoint["common_value_wallet_game"]
         return checkpoint["round"]
 
     def run(self, verbose: bool = True) -> list[dict]:

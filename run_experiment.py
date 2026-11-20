@@ -84,11 +84,10 @@ def parse_args():
                          help="N=2 first-price common-value auction: a shared true value "
                               "V~Uniform(0,1), each agent observing only a private signal "
                               "S_i=V+eps_i with eps_i~Uniform(-NOISE,NOISE) (the 'mineral "
-                              "rights'/wallet-game model). Only n_agents=2, first-price, "
-                              "incompatible with --risk-aversion and --pinn-weight/"
-                              "--pinn-opponent-weight > 0 (supplies its own FOC-based value "
-                              "correction instead) — see "
-                              "fictitious_play.benchmark.equilibrium_bid_common_value.")
+                              "rights' model). Only n_agents=2, first-price, incompatible "
+                              "with --risk-aversion and --pinn-weight/--pinn-opponent-weight "
+                              "> 0 (supplies its own FOC-based value correction instead) — "
+                              "see fictitious_play.benchmark.equilibrium_bid_common_value.")
     parser.add_argument("--common-value-gaussian", type=float, nargs=3, default=None,
                          metavar=("PRIOR_MEAN", "PRIOR_STD", "NOISE_STD"),
                          help="Like --common-value-noise, but V~Normal(PRIOR_MEAN, PRIOR_STD^2) "
@@ -100,6 +99,17 @@ def parse_args():
                               "equilibrium to compare against) and rely on --payoff-rel-tol for "
                               "early stopping instead. Same n_agents=2/first-price/pinn-weight "
                               "restrictions as --common-value-noise.")
+    parser.add_argument("--common-value-wallet-game", action="store_true",
+                         help="The classic 'wallet game' common-value auction: n_agents "
+                              "independent signals S_i~Uniform(0,1), true value V=sum(S_i) "
+                              "(no noise, your own signal *is* your exact share of the "
+                              "value). Has a known closed-form equilibrium for any N (see "
+                              "fictitious_play.benchmark.equilibrium_bid_wallet_game), but "
+                              "training is only wired up for n_agents=2 (the n_agents>=3 "
+                              "equilibrium bid exceeds the signal, which this project's "
+                              "Actor can't represent). Incompatible with --risk-aversion/"
+                              "--common-value-noise/--common-value-gaussian and "
+                              "--pinn-weight/--pinn-opponent-weight > 0.")
     parser.add_argument("--checkpoint-every", type=int, default=20,
                          help="Save a checkpoint every this many rounds (0 disables periodic "
                               "checkpointing; a final checkpoint is always saved).")
@@ -129,6 +139,7 @@ def main():
         opponent_ema_decay=args.opponent_ema_decay, risk_aversion=args.risk_aversion,
         common_value_noise=args.common_value_noise,
         common_value_gaussian=args.common_value_gaussian,
+        common_value_wallet_game=args.common_value_wallet_game,
         max_diff_threshold=args.max_diff_threshold if args.max_diff_threshold >= 0 else None,
         payoff_rel_tol=args.payoff_rel_tol if args.payoff_rel_tol >= 0 else None,
         payoff_stability_window=args.payoff_window,

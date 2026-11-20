@@ -325,3 +325,47 @@ def common_value_posterior_mean_gaussian(own_signal: torch.Tensor, other_signal:
     """
     c = prior_std ** 2 / (2 * prior_std ** 2 + noise_std ** 2)
     return c * (own_signal + other_signal) + prior_mean * (1 - 2 * c)
+
+
+def equilibrium_bid_wallet_game(signal: torch.Tensor, n_agents: int = 2) -> torch.Tensor:
+    """Symmetric Bayes-Nash equilibrium bid for the classic "wallet game"
+    common-value auction: n_agents bidders each observe an independent
+    private signal S_i ~ i.i.d. Uniform(0, 1), and the shared true value is
+    simply their sum, V = sum_i S_i — no noise, no separate latent
+    variable, your own signal *is* your exact share of the value.
+    First-price, risk-neutral.
+
+    Unlike the noisy-signal common-value models above, signals here are
+    independent (your own signal carries no information about anyone
+    else's — it only enters the payoff additively), so there's no
+    Bayesian updating of "what do the others' signals look like given
+    mine" at all. The winner's-curse correction is just E[sum of
+    opponents' signals | you win], and because everything is uniform and
+    independent this reduces to a solvable linear ODE in the bid
+    function, with closed form:
+
+        b*(x) = (n_agents - 1) * (n_agents + 2) / (2 * n_agents) * x
+
+    n_agents=2 gives the famous "bid your own signal" result, b*(x) = x —
+    a standard textbook illustration of a common-value auction (the
+    "wallet game"). For n_agents>=3 the coefficient exceeds 1 (5/3 at
+    n_agents=3): the equilibrium bid actually *exceeds* your own signal,
+    which this project's Actor architecture (b = v*sigmoid(...),
+    structurally capped at b<=v) cannot represent — training is only
+    wired up for n_agents=2 so far, see docs/findings_common_value.md.
+    """
+    k = (n_agents - 1) * (n_agents + 2) / (2 * n_agents)
+    return k * signal
+
+
+def theoretical_win_probability_wallet_game(b: torch.Tensor, n_agents: int = 2) -> torch.Tensor:
+    """P(win | b) implied by all other n_agents-1 opponents bidding at the
+    wallet-game equilibrium b*(y) = k*y (see equilibrium_bid_wallet_game).
+    Each opponent's bid is then Uniform[0, k], so beating all of them at
+    once gives P(win | b) = (b/k)^(n_agents-1) for b in [0, k] — same
+    derivation as theoretical_win_probability_first_price, just scaled by k.
+    """
+    k = (n_agents - 1) * (n_agents + 2) / (2 * n_agents)
+    if k == 0:
+        return torch.ones_like(b)
+    return (b.clamp(0.0, k) / k) ** (n_agents - 1)

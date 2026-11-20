@@ -7,10 +7,12 @@ from .benchmark import (
     equilibrium_bid_common_value,
     equilibrium_bid_lambda,
     equilibrium_bid_risk_averse,
+    equilibrium_bid_wallet_game,
     theoretical_expected_payoff,
     theoretical_win_probability,
     theoretical_win_probability_lambda,
     theoretical_win_probability_risk_averse,
+    theoretical_win_probability_wallet_game,
 )
 from .train import FictitiousPlayTrainer
 
@@ -78,13 +80,22 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
     risk_aversion = trainer.risk_aversion
     common_value_noise = trainer.common_value_noise
     common_value_gaussian = trainer.common_value_gaussian
-    is_common_value = common_value_noise is not None or common_value_gaussian is not None
+    common_value_wallet_game = trainer.common_value_wallet_game
+    # "is_common_value" governs signal-vs-value terminology (x-axis label,
+    # "aprendido" vs. "aprendido vs. sinal") for all three common-value
+    # variants alike; whether each one actually *has* a known theoretical
+    # bid curve to overlay is handled separately below (wallet_game does,
+    # the other two don't).
+    is_common_value = (common_value_noise is not None or common_value_gaussian is not None
+                        or common_value_wallet_game)
     if risk_aversion is not None:
         label_suffix = f"first_price, risk_aversion={risk_aversion}"
     elif common_value_noise is not None:
         label_suffix = f"common_value, noise={common_value_noise}"
     elif common_value_gaussian is not None:
         label_suffix = f"common_value_gaussian, params={common_value_gaussian}"
+    elif common_value_wallet_game:
+        label_suffix = f"common_value_wallet_game, N={n_agents}"
     elif payment_share is not None:
         label_suffix = f"payment_share={payment_share:.2f}"
         bid_formula = f"b*(v) = (N-1)v^N / (N*[(1-{payment_share:.2f})v^(N-1)+{payment_share:.2f}])"
@@ -93,6 +104,10 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
         bid_formula = ("b*(v) = v*(N-1)/N" if trainer.auction_type == "first_price"
                        else "b*(v) = v^N*(N-1)/N")
 
+    # Whether each variant actually has a known theoretical bid curve
+    # (wallet_game does; common_value_noise/gaussian don't — see their
+    # benchmark.py docstrings).
+    no_theoretical_bid = common_value_gaussian is not None
     if common_value_noise is not None:
         grid_lo, grid_hi = common_value_interior_range(common_value_noise)
     elif common_value_gaussian is not None:
@@ -115,6 +130,8 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
                 b_star = equilibrium_bid(v_grid, n_agents, trainer.auction_type).squeeze(1).cpu()
         elif common_value_noise is not None:
             b_star = equilibrium_bid_common_value(v_grid, common_value_noise).squeeze(1).cpu()
+        elif common_value_wallet_game:
+            b_star = equilibrium_bid_wallet_game(v_grid, n_agents).squeeze(1).cpu()
         # common_value_gaussian: no b_star, no known equilibrium to plot.
 
     plt.figure()
@@ -124,9 +141,13 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
         if risk_aversion is not None:
             b_star_i = equilibrium_bid_risk_averse(v_grid, i, tuple(risk_aversion)).squeeze(1).cpu()
             plt.plot(v_grid_cpu, b_star_i, "--", label=f"Agente {i} (teórico, rho={risk_aversion[i]})")
-    if risk_aversion is None and common_value_gaussian is None:
-        label = ("Equilíbrio teórico b*(x) = x - noise" if common_value_noise is not None
-                 else f"Equilíbrio teórico {bid_formula}")
+    if risk_aversion is None and not no_theoretical_bid:
+        if common_value_noise is not None:
+            label = "Equilíbrio teórico b*(x) = x - noise"
+        elif common_value_wallet_game:
+            label = "Equilíbrio teórico b*(x) = (N-1)(N+2)/(2N) * x"
+        else:
+            label = f"Equilíbrio teórico {bid_formula}"
         plt.plot(v_grid_cpu, b_star, "--", color="black", label=label)
     xlabel = "Sinal x" if is_common_value else "Valor v"
     plt.xlabel(xlabel)
@@ -151,12 +172,14 @@ def save_all_plots(trainer: FictitiousPlayTrainer, history: list[dict],
                 b_grid, critic_agent, tuple(risk_aversion)).cpu()
         elif payment_share is not None:
             theoretical_p_win = theoretical_win_probability_lambda(b_grid, n_agents, payment_share).cpu()
+        elif common_value_wallet_game:
+            theoretical_p_win = theoretical_win_probability_wallet_game(b_grid, n_agents).cpu()
         elif not is_common_value:
             theoretical_p_win = theoretical_win_probability(b_grid, n_agents, trainer.auction_type).cpu()
 
     plt.figure()
     plt.plot(b_grid.cpu(), learned_p_win, label=f"Crítico aprendido ({trainer.critic_type})")
-    if not is_common_value:
+    if not no_theoretical_bid and (not is_common_value or common_value_wallet_game):
         plt.plot(b_grid.cpu(), theoretical_p_win, "--", color="black", label="P(vitória|b) teórica")
     else:
         # No single theoretical P(win|b) applies here: the win probability

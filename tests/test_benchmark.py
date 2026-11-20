@@ -12,10 +12,12 @@ from fictitious_play.benchmark import (
     equilibrium_bid_first_price,
     equilibrium_bid_lambda,
     equilibrium_bid_risk_averse,
+    equilibrium_bid_wallet_game,
     theoretical_win_probability_all_pay,
     theoretical_win_probability_first_price,
     theoretical_win_probability_lambda,
     theoretical_win_probability_risk_averse,
+    theoretical_win_probability_wallet_game,
 )
 
 
@@ -190,3 +192,50 @@ def test_common_value_posterior_mean_gaussian_shrinks_toward_prior_on_diagonal()
     x = torch.tensor([120.0])
     estimate = common_value_posterior_mean_gaussian(x, x, prior_mean, prior_std, noise_std)
     assert prior_mean < estimate.item() < x.item()
+
+
+def test_wallet_game_recovers_bid_your_signal_at_n_equals_2():
+    """n_agents=2 is the textbook 'bid your own signal' result."""
+    x = torch.linspace(0.1, 0.9, 5)
+    assert torch.allclose(equilibrium_bid_wallet_game(x, n_agents=2), x)
+
+
+def test_wallet_game_equilibrium_is_mutual_best_response():
+    """Core correctness check for the N-bidder wallet-game equilibrium
+    (see equilibrium_bid_wallet_game's docstring): Monte Carlo the actual
+    expected payoff of deviating to a candidate bid, with every opponent
+    playing the solved equilibrium b(y)=k*y, and check the maximizer
+    matches the solved bid itself. Checked up to n_agents=4, beyond the
+    n_agents=2 case training is actually wired up for, to make sure the
+    general-N derivation itself (not just the n_agents=2 special case) is
+    right before trusting it for anything."""
+    rng = np.random.default_rng(0)
+    n_mc = 20_000_000
+
+    for n_agents in (2, 3, 4):
+        k = (n_agents - 1) * (n_agents + 2) / (2 * n_agents)
+        for x in (0.2, 0.5, 0.8):
+            y_opp = rng.uniform(0.0, 1.0, size=(n_mc, n_agents - 1))
+            v_true = x + y_opp.sum(axis=1)
+            max_opp_bid = k * y_opp.max(axis=1)
+
+            def neg_expected_payoff(beta, v_true=v_true, max_opp_bid=max_opp_bid):
+                win = max_opp_bid < beta
+                return -((v_true - beta) * win).mean()
+
+            res = minimize_scalar(neg_expected_payoff, bounds=(0.0, k * 1.5),
+                                   method="bounded", options={"xatol": 1e-4})
+            b_pred = k * x
+            assert abs(res.x - b_pred) < 0.02, (
+                f"n_agents={n_agents}, x={x}: best response {res.x} != solved bid {b_pred}"
+            )
+
+
+def test_wallet_game_win_probability_is_monotonic_and_bounded():
+    for n_agents in (2, 3, 4):
+        k = (n_agents - 1) * (n_agents + 2) / (2 * n_agents)
+        b = torch.linspace(0.0, k, 50)
+        p = theoretical_win_probability_wallet_game(b, n_agents)
+        assert torch.all(p >= 0.0) and torch.all(p <= 1.0)
+        assert torch.all(p[1:] - p[:-1] >= -1e-6)
+        assert p[-1].item() == pytest.approx(1.0)

@@ -6,6 +6,7 @@ from fictitious_play.benchmark import (
     equilibrium_bid_common_value,
     equilibrium_bid_lambda,
     equilibrium_bid_risk_averse,
+    equilibrium_bid_wallet_game,
 )
 from fictitious_play.critic import (
     BetaCritic,
@@ -480,6 +481,53 @@ def test_common_value_gaussian_trains_without_error_with_kumaraswamy_critic():
     trainer = FictitiousPlayTrainer(
         n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
         common_value_gaussian=(100.0, 10.0, 2.0), critic_type="kumaraswamy",
+        max_diff_threshold=None, payoff_rel_tol=None, seed=0,
+    )
+    history = trainer.run(verbose=False)
+    assert len(history) == 3
+
+
+def test_wallet_game_rejects_n_agents_other_than_two():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=3, common_value_wallet_game=True)
+
+
+def test_wallet_game_rejects_non_first_price():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, auction_type="all_pay", common_value_wallet_game=True)
+
+
+def test_wallet_game_rejects_other_common_value_variants():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_noise=0.1, common_value_wallet_game=True)
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_gaussian=(100.0, 10.0, 2.0),
+                               common_value_wallet_game=True)
+
+
+def test_wallet_game_rejects_pinn_weight():
+    with pytest.raises(ValueError):
+        FictitiousPlayTrainer(n_agents=2, common_value_wallet_game=True, pinn_weight=0.1)
+
+
+def test_wallet_game_benchmark_metrics_use_wallet_game_target():
+    trainer = FictitiousPlayTrainer(n_agents=2, common_value_wallet_game=True,
+                                     sample_size=100, seed=0)
+
+    class _ZeroActor:
+        def __call__(self, v):
+            return torch.zeros_like(v)
+
+    trainer.agents = [_ZeroActor(), _ZeroActor()]
+    _, max_diff = trainer._benchmark_metrics(0)
+    target = equilibrium_bid_wallet_game(trainer.eval_grid, 2)
+    assert max_diff == pytest.approx(target.max().item(), abs=1e-4)
+
+
+def test_wallet_game_trains_without_error_with_kumaraswamy_critic():
+    trainer = FictitiousPlayTrainer(
+        n_agents=2, n_rounds=3, sample_size=5_000, max_steps=100, patience=20,
+        common_value_wallet_game=True, critic_type="kumaraswamy",
         max_diff_threshold=None, payoff_rel_tol=None, seed=0,
     )
     history = trainer.run(verbose=False)
